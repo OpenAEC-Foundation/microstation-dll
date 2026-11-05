@@ -192,6 +192,13 @@ pub mod v8 {
         e.extend_from_slice(data);
         if e.len() % 2 == 1 { e.push(0); }
         let attindx = (e.len() / 2) as u32;
+        e[8..12].copy_from_slice(&attindx.to_le_bytes());
+        with_strings(e, strings)
+    }
+
+    /// Appends string linkages (§B.7): header (user bit, the number of words after it), ID
+    /// 0x56D2, key, number of bytes, the bytes; and updates the element's length.
+    pub fn with_strings(mut e: Vec<u8>, strings: &[(u32, &str)]) -> Vec<u8> {
         for (key, text) in strings {
             let mut linkage = vec![0, 0, 0xD2, 0x56];
             linkage.extend(key.to_le_bytes());
@@ -199,12 +206,116 @@ pub mod v8 {
             linkage.extend(text.as_bytes());
             if linkage.len() % 2 == 1 { linkage.push(0); }
             let words = (linkage.len() / 2) as u16;
-            linkage[..2].copy_from_slice(&(0x1000 | words).to_le_bytes());
+            linkage[..2].copy_from_slice(&(0x1000 | (words - 1)).to_le_bytes());
             e.extend(linkage);
         }
         let words = (e.len() / 2) as u32;
         e[4..8].copy_from_slice(&words.to_le_bytes());
-        e[8..12].copy_from_slice(&attindx.to_le_bytes());
+        e
+    }
+
+    /// A model header stream (§B.5, §B.15), compressed: `uor` UOR per storage unit,
+    /// `numerator / denominator` storage units per metre, the global origin in UOR, the master
+    /// unit the metre (named `m`), the sub unit the millimetre (`mm`), the model's name and 3D bit.
+    pub fn model_header_stream(uor: f64, numerator: f64, denominator: f64, origin: [f64; 3], name: Option<&str>, three_d: bool) -> Vec<u8> {
+        let mut e = vec![0u8; 0x100];
+        e[..2].copy_from_slice(&66u16.to_le_bytes());
+        e[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
+        e[8..12].copy_from_slice(&0x80u32.to_le_bytes());
+        e[0x0C..0x10].copy_from_slice(&32u32.to_le_bytes());
+        e[0x44..0x48].copy_from_slice(&u32::from(three_d).to_le_bytes());
+        let fields = [
+            (0x50, 1.0), (0x58, 1.0), (0x60, 1000.0), (0x68, 1.0), (0x70, origin[0]), (0x78, origin[1]), (0x80, origin[2]),
+            (0xE0, uor), (0xE8, numerator), (0xF0, denominator),
+        ];
+        for (at, value) in fields { e[at..at + 8].copy_from_slice(&f64::to_le_bytes(value)); }
+        let mut strings = vec![(19, "m"), (20, "mm")];
+        if let Some(name) = name { strings.push((1, name)); }
+        let mut plain = vec![0u8; 4096 + 4];
+        plain.extend(with_strings(e, &strings));
+        zlib(&plain, 6)
+    }
+
+    /// The file header stream `Dgn~H` (§B.14): 20 bytes, then zlib data of 1576 bytes with the
+    /// format revision at +0x118.
+    pub fn file_header(revision: u32) -> Vec<u8> {
+        let mut plain = vec![0u8; 1576];
+        for (at, value) in [(0x114, 8u32), (0x118, revision), (0x11C, 2)] { plain[at..at + 4].copy_from_slice(&value.to_le_bytes()); }
+        let mut out = vec![1, 0, 4, 0];
+        out.resize(20, 0);
+        out.extend(zlib(&plain, 6));
+        out
+    }
+
+    /// An OLE summary information stream ([MS-OLEPS]) with the application name (property 18).
+    pub fn summary_information(application: &str) -> Vec<u8> {
+        let mut text = application.as_bytes().to_vec();
+        text.push(0);
+        let mut value = 0x1Eu32.to_le_bytes().to_vec();
+        value.extend((text.len() as u32).to_le_bytes());
+        value.extend(&text);
+        value.resize(value.len().div_ceil(4) * 4, 0);
+        // The set: size, one property (18 at offset 16), the value.
+        let mut set = ((16 + value.len()) as u32).to_le_bytes().to_vec();
+        set.extend(1u32.to_le_bytes());
+        set.extend(18u32.to_le_bytes());
+        set.extend(16u32.to_le_bytes());
+        set.extend(value);
+        let mut out = vec![0xFE, 0xFF, 0, 0];
+        out.extend([0; 4 + 16]);
+        out.extend(1u32.to_le_bytes());
+        out.extend([0; 16]);
+        out.extend(48u32.to_le_bytes());
+        out.extend(set);
+        out
+    }
+
+    /// A cone (§B.16) between circles of `r1` around `c1` and `r2` around `c2`, with the identity
+    /// orientation.
+    pub fn cone(level: u32, c1: [f64; 3], r1: f64, c2: [f64; 3], r2: f64) -> Vec<u8> {
+        let mut data = vec![0u8; 8];
+        data.extend(doubles(&[1.0, 0.0, 0.0, 0.0]));
+        data.extend(doubles(&c1));
+        data.extend(doubles(&[r1]));
+        data.extend(doubles(&c2));
+        data.extend(doubles(&[r2]));
+        element(23, 0x1000, level, shown(D3, 0), &data, &[])
+    }
+
+    /// A mesh (§B.17): the header 105, then a vertex array (101 role 2, 103 of doubles) and an
+    /// index array (101 role 1, 102 of i32: 1-based, 0 closes a face).
+    pub fn mesh(level: u32, vertices: &[[f64; 3]], indices: &[i32]) -> Vec<Vec<u8>> {
+        let header = |role: u32, per_item: u32| {
+            let mut data = 0u32.to_le_bytes().to_vec();
+            for value in [per_item, 1, role] { data.extend(value.to_le_bytes()); }
+            element(101, 0x4000, level, shown(D3, 0), &data, &[])
+        };
+        let array = |kind: u16, count: usize, values: Vec<u8>| {
+            let mut data = Vec::new();
+            for value in [count as u32, count as u32, 0x1121, 0] { data.extend(value.to_le_bytes()); }
+            data.extend(values);
+            element(kind, 0x4000, level, shown(D3, 0), &data, &[])
+        };
+        let mut head = 4u32.to_le_bytes().to_vec();
+        head.extend(1u32.to_le_bytes());
+        vec![
+            element(105, 0x2000, level, shown(D3, 0), &head, &[]),
+            header(2, 3),
+            array(103, 3 * vertices.len(), doubles(&vertices.concat())),
+            header(1, 1),
+            array(102, indices.len(), indices.iter().flat_map(|i| i.to_le_bytes()).collect()),
+        ]
+    }
+
+    /// A reference attachment (type 100, §B.20) with sequence `number`, the file name in string
+    /// linkage 3, the master-side origin `at` (UOR), identity matrix and scale 1.
+    pub fn reference_attachment(number: u32, file: &str, at: [f64; 3]) -> Vec<u8> {
+        let mut data = vec![0u8; 0xA8 - 0x68];
+        data.extend(doubles(&[0.0; 3]));
+        data.extend(doubles(&at));
+        data.extend(doubles(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0]));
+        let mut e = element(100, 0x2040, 0, Some([0, 0, 0]), &data, &[(3, file)]);
+        e[0x2C..0x30].copy_from_slice(&number.to_le_bytes());
         e
     }
 
@@ -297,45 +408,60 @@ pub mod v8 {
         element
     }
 
-    /// A V8 design file: the model header, the graphic elements of the model, the non-model
-    /// elements and any further streams.
+    /// A further model: its ID, whether it is hidden (`Dgn-Nd`), header and graphic elements.
+    pub struct ExtraModel {
+        pub id: u32,
+        pub hidden: bool,
+        pub header: Vec<u8>,
+        pub graphics: Vec<u8>,
+    }
+
+    /// A V8 design file: the default model (header, graphic and control elements), the
+    /// non-model elements, further models, file header and summary information, and any further
+    /// streams.
     pub struct File {
         pub header: Vec<u8>,
         pub graphics: Vec<u8>,
+        pub controls: Vec<u8>,
         pub tables: Vec<u8>,
+        pub models: Vec<ExtraModel>,
+        pub revision: Option<u32>,
+        pub application: Option<String>,
         pub extra: Vec<(String, Vec<u8>)>,
+    }
+
+    /// Appends an element with its 4-byte prefix to an element stream.
+    pub fn push(stream: &mut Vec<u8>, element: Vec<u8>) {
+        stream.extend([0; 4]);
+        stream.extend(element);
     }
 
     impl File {
         /// `uor` UOR per storage unit, `numerator / denominator` storage units per metre, the
-        /// global origin in UOR (B.5). The master unit is the metre, the sub unit the millimetre.
+        /// global origin in UOR (B.5). The master unit is the metre, the sub unit the millimetre;
+        /// the default model is a 2D model without a name.
         pub fn new(uor: f64, numerator: f64, denominator: f64, origin: [f64; 3]) -> Self {
-            let mut e = vec![0u8; 0x100];
-            e[..2].copy_from_slice(&66u16.to_le_bytes());
-            e[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
-            e[4..8].copy_from_slice(&0x80u32.to_le_bytes());
-            e[8..12].copy_from_slice(&0x80u32.to_le_bytes());
-            let fields = [
-                (0x50, 1.0), (0x58, 1.0), (0x60, 1000.0), (0x68, 1.0), (0x70, origin[0]), (0x78, origin[1]), (0x80, origin[2]),
-                (0xE0, uor), (0xE8, numerator), (0xF0, denominator),
-            ];
-            for (at, value) in fields { e[at..at + 8].copy_from_slice(&f64::to_le_bytes(value)); }
-            let mut plain = vec![0u8; 4096 + 4];
-            plain.extend(e);
-            File { header: zlib(&plain, 6), graphics: Vec::new(), tables: Vec::new(), extra: Vec::new() }
+            File {
+                header: model_header_stream(uor, numerator, denominator, origin, None, false),
+                graphics: Vec::new(), controls: Vec::new(), tables: Vec::new(), models: Vec::new(), revision: None, application: None, extra: Vec::new(),
+            }
         }
 
-        /// Adds a graphic element of the model (with its 4-byte prefix).
+        /// Adds a graphic element of the default model.
         pub fn graphic(&mut self, element: Vec<u8>) -> &mut Self {
-            self.graphics.extend([0; 4]);
-            self.graphics.extend(element);
+            push(&mut self.graphics, element);
+            self
+        }
+
+        /// Adds a control element of the default model (`Dgn^C`).
+        pub fn control(&mut self, element: Vec<u8>) -> &mut Self {
+            push(&mut self.controls, element);
             self
         }
 
         /// Adds a non-model element (`Dgn^Nm`).
         pub fn table(&mut self, element: Vec<u8>) -> &mut Self {
-            self.tables.extend([0; 4]);
-            self.tables.extend(element);
+            push(&mut self.tables, element);
             self
         }
 
@@ -358,8 +484,14 @@ pub mod v8 {
             }
             streams.push(("Dgn^Nm/$1".into(), block(&self.tables, 6)));
             streams.push(("Dgn-Md/#000000/Dgn~Mh".into(), self.header.clone()));
-            streams.push(("Dgn-Md/#000000/Dgn^C/$1".into(), vec![0; 16]));
-            streams.push(("Dgn~H".into(), vec![0; 80]));
+            streams.push(("Dgn-Md/#000000/Dgn^C/$1".into(), if self.controls.is_empty() { vec![0; 16] } else { block(&self.controls, 6) }));
+            for m in &self.models {
+                let storage = format!("{}/#{:06x}", if m.hidden { "Dgn-Nd" } else { "Dgn-Md" }, m.id);
+                streams.push((format!("{storage}/Dgn~Mh"), m.header.clone()));
+                streams.push((format!("{storage}/Dgn^G/$1"), block(&m.graphics, 6)));
+            }
+            streams.push(("Dgn~H".into(), self.revision.map_or(vec![0; 80], file_header)));
+            if let Some(application) = &self.application { streams.push(("\u{5}SummaryInformation".into(), summary_information(application))); }
             streams.extend(self.extra.iter().cloned());
             compound(&streams)
         }

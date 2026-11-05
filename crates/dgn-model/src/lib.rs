@@ -37,10 +37,17 @@ pub enum Format {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Design {
     pub format: Format,
-    /// A 3D design (V7: the design file header; V8: any 3D graphic element in the model).
+    /// V8: the format revision in the file header (`Dgn~H`): 5 (V8 2004 Edition), 103 and 104
+    /// (V8i), 202 (CONNECT Edition and later).
+    pub revision: Option<u32>,
+    /// V8: the application that wrote the file (OLE summary information), such as
+    /// `MicroStation v8.11.7.443`.
+    pub application: Option<String>,
+    /// A 3D design (V7: the design file header; V8: the default model is 3D).
     pub three_d: bool,
+    /// Units of the default model.
     pub units: Units,
-    /// The global origin in UOR.
+    /// The global origin of the default model in UOR.
     pub global_origin: Point,
     /// Levels with a name or symbology in the file, by ascending ID. V7 files have none: their
     /// levels are only numbers (1 to 63).
@@ -48,11 +55,12 @@ pub struct Design {
     /// The stored colour table: 256 RGB slots, slot 0 the background, colour `c` in slot `c + 1`.
     /// `None`: no table in the file (see [`default_color`]).
     pub colors: Option<Vec<[u8; 3]>>,
-    /// The models read. V7 files have one; V8 files the first design model (`#000000`).
+    /// The models: V7 files have one; V8 files every model, the default model (`#000000`)
+    /// first, models the file keeps out of its index (`hidden`) last.
     pub models: Vec<Model>,
     /// Shared cell definitions (V8), placed by [`Geometry::SharedCell`] elements.
     pub shared_cells: Vec<SharedCellDefinition>,
-    /// Reference file attachments (V7, ISFF type 5 level 9 and type 66 level 5).
+    /// Reference file attachments (V7: ISFF type 5 level 9 and type 66 level 5; V8: type 100).
     pub references: Vec<Reference>,
     /// Elements and parts that were not read, by what they are, with their number.
     pub skipped: BTreeMap<String, usize>,
@@ -102,7 +110,16 @@ pub struct Symbology {
 /// One model: the graphic elements in file order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
+    /// V8: the model ID (the storage `#NNNNNN`, hexadecimal); V7: 0.
+    pub id: u32,
     pub name: Option<String>,
+    pub description: Option<String>,
+    pub three_d: bool,
+    /// V8: a model the file keeps out of its model index (storage `Dgn-Nd`).
+    pub hidden: bool,
+    pub units: Units,
+    /// The global origin in UOR.
+    pub global_origin: Point,
     pub elements: Vec<Element>,
 }
 
@@ -164,6 +181,8 @@ pub enum Geometry {
     Surface(Surface),
     /// Type 33: a 2D linear dimension (V8).
     Dimension(Dimension),
+    /// Type 105 with its arrays (V8): faces between vertices.
+    Mesh(Mesh),
 }
 
 /// A line of text. Its box runs from `origin` (the lower left) along `x_axis` and `y_axis`.
@@ -191,6 +210,9 @@ pub struct Cell {
     /// in ISFF order, the low bit of each long = 4.6566e-6). Informational: the components are
     /// already placed.
     pub transform: Option<Vec<f64>>,
+    /// A smart solid or surface (V8): the cell holds the exact Parasolid B-rep, which is not
+    /// read; its components are the wireframe.
+    pub brep: bool,
     pub children: Vec<Element>,
 }
 
@@ -204,7 +226,7 @@ pub struct SharedCell {
     pub origin: Point,
 }
 
-/// A shared cell definition (V8 type 34, in the non-model elements).
+/// A shared cell definition (type 34; V8: in the non-model elements).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedCellDefinition {
     pub name: String,
@@ -263,8 +285,18 @@ pub struct Surface {
     pub surface_type: u8,
     /// A surface or solid of revolution (otherwise of projection).
     pub revolution: bool,
-    /// The boundary (class 0) and rule elements, each with its outline.
+    /// Successive boundary elements (class 0) of this many form one boundary.
+    pub elements_per_boundary: usize,
+    /// The boundary (class 0) and rule (class 4) elements, each with its outline.
     pub children: Vec<Element>,
+}
+
+/// An indexed mesh.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mesh {
+    pub vertices: Vec<Point>,
+    /// Faces as polygons of 0-based vertex indices (at least three each).
+    pub faces: Vec<Vec<usize>>,
 }
 
 /// A 2D linear dimension: extension lines from `points` to their `feet` on the dimension line.
@@ -281,22 +313,26 @@ pub struct Dimension {
     pub distances: Vec<f64>,
 }
 
-/// A reference file attachment (V7).
+/// A reference file attachment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reference {
+    /// V7: the file number; V8: the sequence number of the attachment.
+    pub number: u32,
+    /// V8: the model the attachment belongs to.
+    pub model: Option<u32>,
+    /// As stored: may be a full or ProjectWise path; look for the bare file name beside the design.
     pub file_name: String,
     pub logical_name: String,
     pub description: String,
-    pub file_number: u8,
-    /// Displayed (the display bit of the file displayer options).
-    pub display: bool,
-    /// The reference file was missing when the design was last saved.
-    pub missing: bool,
+    /// V7: displayed (the display bit of the file displayer options).
+    pub display: Option<bool>,
+    /// V7: the reference file was missing when the design was last saved.
+    pub missing: Option<bool>,
     /// The origin in the reference file, in its UOR.
     pub reference_origin: Point,
     /// Where that origin lies in this design, in UOR.
     pub master_origin: Point,
-    /// The transformation from the reference file, nine values as stored.
+    /// The transformation from the reference file, nine values as stored (V8: row by row).
     pub matrix: [f64; 9],
     /// Conversion factor from reference UOR to master UOR.
     pub scale: f64,
@@ -367,6 +403,22 @@ impl Design {
     }
 }
 
+impl Design {
+    /// The default model: the first one.
+    pub fn default_model(&self) -> Option<&Model> { self.models.first() }
+
+    /// A label for the file revision: `202 (CONNECT Edition or later)`.
+    pub fn revision_label(&self) -> Option<String> {
+        self.revision.map(|r| format!("{r} ({})", match r {
+            5 => "V8 2004 Edition",
+            103 | 104 => "V8i",
+            202 => "CONNECT Edition or later",
+            r if r > 202 => "newer than CONNECT",
+            _ => "unknown",
+        }))
+    }
+}
+
 impl Element {
     /// The components of a complex element.
     pub fn children(&self) -> &[Element] {
@@ -402,7 +454,8 @@ pub fn kind_name(kind: u16) -> &'static str {
         18 => "Surface", 19 => "Solid", 21 => "B-spline poles", 22 => "Point string", 23 => "Cone",
         24 => "B-spline surface", 25 => "B-spline boundary", 26 => "B-spline knots", 27 => "B-spline curve",
         28 => "B-spline weights", 33 => "Dimension", 34 => "Shared cell definition", 35 => "Shared cell",
-        36 => "Multi-line", 37 => "Tag", 87 => "Raster header", 88 => "Raster data",
+        36 => "Multi-line", 37 => "Tag", 38 => "Parasolid data", 87 => "Raster header", 88 => "Raster data",
+        100 => "Reference attachment", 105 => "Mesh",
         _ => "Unknown element",
     }
 }
@@ -422,6 +475,8 @@ mod tests {
     fn design() -> Design {
         Design {
             format: Format::V8,
+            revision: None,
+            application: None,
             three_d: false,
             units: Units { metres_per_uor: 0.001, metres_per_master: 1.0, metres_per_sub: 0.001, master_name: None, sub_name: None, stored: true, description: String::new() },
             global_origin: [1000.0, 0.0, 0.0],
@@ -458,7 +513,7 @@ mod tests {
         d.colors = Some(table);
         assert_eq!(d.rgb(3), [1, 2, 3], "colour c is slot c + 1");
         assert_eq!(d.to_metres([3000.0, 500.0, 0.0]), [2.0, 0.5, 0.0]);
-        assert_eq!(kind_label(105), "Element type 105");
+        assert_eq!(kind_label(107), "Element type 107");
         assert_eq!(kind_label(3), "Line");
     }
 }

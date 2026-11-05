@@ -314,9 +314,9 @@ fn v8_shapes_arcs_text_cells_and_skipped_elements() {
     // A cell whose only string linkage has another key: no name.
     f.graphic(element(2, 0x3000, 12, shown(0, 0), &[1, 0, 0, 0, 0, 0, 0, 0], &[(0, "NOT A NAME")]));
     f.graphic(element(3, 0x5000, 12, shown(0, 0), &doubles(&[0.0, 16_000.0, 1000.0, 16_000.0]), &[]));
-    // Not described yet: a dimension, an unknown type and a second model.
+    // Not described yet: a dimension and an unknown type; and a second model, which is read.
     f.graphic(element(33, 0x1000, 11, shown(0, 0), &[0; 64], &[]));
-    f.graphic(element(105, 0x1000, 11, shown(0, 0), &[0; 64], &[]));
+    f.graphic(element(107, 0x1000, 11, shown(0, 0), &[0; 64], &[]));
     f.extra.push(("Dgn-Md/#000001/Dgn^G/$1".into(), vec![0; 16]));
     let scene = load(f.bytes()).unwrap();
     let layer = |name: &str| scene.layers.iter().find(|l| l.name == name).unwrap_or_else(|| panic!("no layer {name}"));
@@ -344,7 +344,8 @@ fn v8_shapes_arcs_text_cells_and_skipped_elements() {
     for drawn in ["Arc: 1", "Cell: 2", "Complex shape: 1", "Ellipse: 1", "Point string: 1", "Shape: 2", "Text: 1", "Text node: 1"] {
         assert!(elements.contains(drawn), "{drawn} in {elements}");
     }
-    assert_eq!(info(&scene, "DGN skipped elements"), "Dimension: 1, Element type 105: 1, Further model (not read): 1");
+    assert_eq!(info(&scene, "DGN skipped elements"), "Dimension: 1, Element type 107: 1");
+    assert_eq!(info(&scene, "DGN models"), "2: #0, #1");
 }
 
 #[test]

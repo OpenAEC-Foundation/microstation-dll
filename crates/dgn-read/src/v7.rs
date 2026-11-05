@@ -5,8 +5,11 @@
 //! and level word and its length in words (§A.3); complex elements are followed by their
 //! components, which carry the complex bit.
 
+use std::collections::BTreeMap;
+
 use dgn_model::{
-    kind_label, BSplineCurve, BSplineSurface, Cell, Cone, Design, Element, Format, Geometry, Model, Reference, Surface, Symbology, Text, Units,
+    kind_label, BSplineCurve, BSplineSurface, Cell, Cone, Design, Element, Format, Geometry, Model, Reference, SharedCell, SharedCellDefinition,
+    Surface, Symbology, Text, Units,
 };
 use glam::{DMat3, DVec3};
 
@@ -32,6 +35,8 @@ impl RawElement<'_> {
     /// 32-bit integer, high word first ("middle-endian").
     pub fn ulong(&self, i: usize) -> u32 { (u32::from(self.word(i)) << 16) | u32::from(self.word(i + 1)) }
     pub fn long(&self, i: usize) -> i32 { self.ulong(i) as i32 }
+    /// 32-bit integer, low word first: the longs of shared cells (§A.8).
+    pub fn long_le(&self, i: usize) -> i32 { (u32::from(self.word(i)) | (u32::from(self.word(i + 1)) << 16)) as i32 }
     /// VAX D-float, most significant word first.
     pub fn double(&self, i: usize) -> f64 {
         let u = (0..4).fold(0u64, |u, k| (u << 16) | u64::from(self.word(i + k)));
@@ -192,7 +197,7 @@ pub fn span(all: &[RawElement], i: usize, depth: usize) -> usize {
     let e = all[i];
     let mut j = i + 1;
     match e.kind {
-        2 | 7 | 12 | 14 | 18 | 19 if depth <= MAX_DEPTH => {
+        2 | 7 | 12 | 14 | 18 | 19 | 34 if depth <= MAX_DEPTH => {
             let end = e.offset + 2 * (19 + usize::from(e.word(18)));
             while j < all.len() && all[j].offset < end && all[j].complex {
                 j = span(all, j, depth + 1);
@@ -208,7 +213,7 @@ pub fn span(all: &[RawElement], i: usize, depth: usize) -> usize {
 pub fn read(data: &[u8]) -> Result<Design> {
     let all = elements(data)?;
     let header = Header::new(&all)?;
-    let mut reader = Reader { header: &header, skipped: Skipped::default() };
+    let mut reader = Reader { header: &header, skipped: Skipped::default(), definitions: Vec::new(), names: BTreeMap::new() };
     let mut model = Vec::new();
     let mut references = Vec::new();
     let mut i = 0;
@@ -220,20 +225,27 @@ pub fn read(data: &[u8]) -> Result<Design> {
                 Some(r) => references.push(r),
                 None => reader.skipped.add("Malformed reference attachment"),
             }
+        } else if e.kind == 34 {
+            reader.definition(&all, i);
         } else if e.graphic() {
             if let Some(element) = reader.element(&all, i, 0) { model.push(element); }
         }
         i = next;
     }
+    let origin = point(header.origin);
     Ok(Design {
         format: Format::V7,
+        revision: None,
+        application: None,
         three_d: header.three_d,
         units: header.units.clone(),
-        global_origin: point(header.origin),
+        global_origin: origin,
         levels: Vec::new(),
         colors: header.colors.clone(),
-        models: vec![Model { name: None, elements: model }],
-        shared_cells: Vec::new(),
+        models: vec![Model {
+            id: 0, name: None, description: None, three_d: header.three_d, hidden: false, units: header.units.clone(), global_origin: origin, elements: model,
+        }],
+        shared_cells: reader.definitions,
         references,
         skipped: reader.skipped.0,
     })
@@ -248,12 +260,13 @@ fn reference(e: &RawElement) -> Option<Reference> {
     let clip_count = usize::from(e.word(246)).min(e.words().saturating_sub(247) / 4);
     let longs = |i: usize| [f64::from(e.long(i)), f64::from(e.long(i + 2)), f64::from(e.long(i + 4))];
     Some(Reference {
+        number: e.bytes[103].into(),
+        model: None,
         file_name: e.text(38, file_chars),
         logical_name: e.text(2 * 147, usize::from(e.word(146)).min(22)),
         description: e.text(2 * 159, usize::from(e.word(158)).min(42)),
-        file_number: e.bytes[103],
-        display: e.word(53) & 0x2 != 0,
-        missing: e.word(52) & 0x80 != 0,
+        display: Some(e.word(53) & 0x2 != 0),
+        missing: Some(e.word(52) & 0x80 != 0),
         reference_origin: longs(94),
         matrix: std::array::from_fn(|k| e.double(100 + 4 * k)),
         scale: e.double(136),
@@ -265,9 +278,42 @@ fn reference(e: &RawElement) -> Option<Reference> {
 struct Reader<'a> {
     header: &'a Header,
     skipped: Skipped,
+    /// Shared cell definitions read so far, and the last one of each name.
+    definitions: Vec<SharedCellDefinition>,
+    names: BTreeMap<String, usize>,
 }
 
+/// The name of a shared cell definition or instance: 8 bytes at words 82 to 85, NUL-padded (§A.8).
+fn shared_name(e: &RawElement) -> String { e.text(164, 8) }
+
 impl Reader<'_> {
+    /// A shared cell definition (type 34, §A.8): its name and its components in definition
+    /// coordinates. An instance uses the last definition of its name read before it.
+    fn definition(&mut self, all: &[RawElement], i: usize) {
+        let e = all[i];
+        if e.words() < 86 { self.skipped.add("Malformed element (Shared cell definition)"); return; }
+        let name = shared_name(&e);
+        let children = self.children(all, i, 0);
+        self.names.insert(name.clone(), self.definitions.len());
+        self.definitions.push(SharedCellDefinition { name, children });
+    }
+
+    /// A shared cell instance (type 35, §A.8): the row-major matrix of VAX doubles at word 38, the
+    /// origin as three little-endian longs at word 74 and the definition's name.
+    fn shared_cell(&self, e: &RawElement) -> Option<Geometry> {
+        if e.words() < 86 { return None; }
+        let rows: [f64; 9] = std::array::from_fn(|k| e.double(38 + 4 * k));
+        let origin = [74, 76, 78].map(|w| f64::from(e.long_le(w)));
+        if !rows.iter().all(|v| v.is_finite()) { return None; }
+        let name = shared_name(e);
+        Some(Geometry::SharedCell(SharedCell {
+            definition: self.names.get(&name).copied(),
+            name: Some(name).filter(|n| !n.is_empty()),
+            matrix: [[rows[0], rows[1], rows[2]], [rows[3], rows[4], rows[5]], [rows[6], rows[7], rows[8]]],
+            origin,
+        }))
+    }
+
     /// An element with its display header and `geometry`.
     fn element_of(&self, e: &RawElement, geometry: Geometry) -> Element {
         Element {
@@ -310,6 +356,7 @@ impl Reader<'_> {
                     name: Some(radix50([e.word(19), e.word(20)])),
                     origin: placed.then(|| point(h.point(&e, origin))),
                     transform: placed.then(|| (0..values).map(|k| f64::from(e.long(trans + 2 * k)) * 10_000.0 / UNIT).collect()),
+                    brep: false,
                     children: self.children(all, i, depth),
                 })
             }
@@ -350,7 +397,8 @@ impl Reader<'_> {
                 let surface_type = e.bytes.get(40).copied().unwrap_or(0);
                 let children = (i + 1..span(all, i, 0)).filter_map(|j| self.curve(all, j).map(|g| self.element_of(&all[j], g))).collect();
                 Geometry::Surface(Surface {
-                    solid: e.kind == 19, surface_type, revolution: if e.kind == 18 { surface_type == 8 } else { surface_type == 1 }, children,
+                    solid: e.kind == 19, surface_type, revolution: if e.kind == 18 { surface_type == 8 } else { surface_type == 1 },
+                    elements_per_boundary: 1, children,
                 })
             }
             22 => Geometry::PointString { points: self.vertices(&e).into_iter().map(point).collect(), disjoint: e.h_bit() },
@@ -362,6 +410,12 @@ impl Reader<'_> {
                 Some(g) => g,
                 None => { self.skipped.add("Malformed B-spline surface"); return None; }
             },
+            35 => match self.shared_cell(&e) {
+                Some(g) => g,
+                None => { self.skipped.add("Malformed element (Shared cell)"); return None; }
+            },
+            // A definition among components is not drawn where it stands.
+            34 => return None,
             kind => { self.skipped.add(&kind_label(kind.into())); return None; }
         };
         Some(self.element_of(&e, geometry))
@@ -580,8 +634,8 @@ mod tests {
         w.element(5, 9, 0, 0, 0, &body);
         let design = read(&w.bytes()).unwrap();
         let r = &design.references[0];
-        assert_eq!((r.file_name.as_str(), r.logical_name.as_str(), r.file_number), ("site.dgn", "SITE", 7));
-        assert!(r.missing && r.display);
+        assert_eq!((r.file_name.as_str(), r.logical_name.as_str(), r.number), ("site.dgn", "SITE", 7));
+        assert_eq!((r.missing, r.display), (Some(true), Some(true)));
         assert_eq!((r.reference_origin[0], r.matrix[0], r.scale, r.master_origin[0]), (100.0, 1.0, 2.5, -50.0));
         assert_eq!(r.clip, [[10.0, 0.0], [0.0, 30.0]]);
     }

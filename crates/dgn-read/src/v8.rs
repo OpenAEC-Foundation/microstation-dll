@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use dgn_model::{
-    kind_label, BSplineCurve, Cell, Design, Dimension, Element, Format, Geometry, Level, Model, SharedCell, SharedCellDefinition, Symbology, Text, Units,
+    kind_label, BSplineCurve, BSplineSurface, Cell, Cone, Design, Dimension, Element, Format, Geometry, Level, Mesh, Model, Point, Reference, SharedCell,
+    SharedCellDefinition, Surface, Symbology, Text, Units,
 };
 use glam::{DMat3, DVec3};
 
@@ -43,14 +44,19 @@ impl<'a> RawElement<'a> {
     /// A component of a complex element.
     pub fn component(&self) -> bool { self.flags() & 0x4000 != 0 }
     /// A header with components: flagged, or of a type that always has them.
-    pub fn complex(&self) -> bool { self.flags() & 0x2000 != 0 || matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 34) }
+    pub fn complex(&self) -> bool { self.flags() & 0x2000 != 0 || matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 34 | 105) }
     /// The number of components a header counts (at +0x68), where the specification gives it.
-    pub fn component_count(&self) -> Option<u32> { (matches!(self.kind(), 2 | 7 | 12 | 14 | 27) && self.len() >= 0x6C).then(|| self.u32(0x68)) }
+    pub fn component_count(&self) -> Option<u32> {
+        (matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 105) && self.len() >= 0x6C).then(|| self.u32(0x68))
+    }
     /// The level ID (graphic elements) or kind of table entry (non-graphic elements).
     pub fn level(&self) -> u32 { self.u32(0x0C) }
     pub fn id(&self) -> u64 { self.u64(0x10) }
+    /// Elements with display geometry. Not: tables (flag 0x0400; types 5, 9, 66, 95 to 99), knots and
+    /// weights (26, 28), Parasolid data (38) and XAttribute carriers (106) of §B.18, reference
+    /// attachments (100).
     pub fn graphic(&self) -> bool {
-        self.flags() & 0x0400 == 0 && !matches!(self.kind(), 0 | 1 | 5 | 8 | 9 | 10 | 26 | 28 | 66 | 95..=99) && self.len() >= 0x68
+        self.flags() & 0x0400 == 0 && !matches!(self.kind(), 0 | 1 | 5 | 8 | 9 | 10 | 26 | 28 | 38 | 66 | 95..=100 | 106) && self.len() >= 0x68
     }
     pub fn properties(&self) -> u32 { self.u32(0x28) }
     /// Two or three coordinates per point: per element in V8.
@@ -97,14 +103,16 @@ impl<'a> RawElement<'a> {
         (0..count.min(available)).map(|k| self.point(first + k * size)).collect()
     }
     /// The linkages behind the element data, from byte `2 × attindx` (§B.7): ID and the whole
-    /// linkage including its header.
+    /// linkage including its header. The low byte of the header word counts the words after it,
+    /// so a linkage is that many plus one words long (v0.2); a header word 0 or a count 0 ends.
     pub fn linkages(&self) -> Vec<(u16, &'a [u8])> {
         let bytes: &'a [u8] = self.bytes;
         let mut at = (self.u32(8) as usize).saturating_mul(2);
         let mut out = Vec::new();
         while at.saturating_add(4) <= bytes.len() {
-            let words = usize::from(self.u16(at) & 0xFF);
-            if words == 0 { break; }
+            let header = self.u16(at);
+            let words = usize::from(header & 0xFF) + 1;
+            if header == 0 || words == 1 { break; }
             let end = bytes.len().min(at + 2 * words);
             out.push((self.u16(at + 2), &bytes[at..end]));
             at += 2 * words;
@@ -130,10 +138,12 @@ impl<'a> RawElement<'a> {
     pub fn name(&self) -> Option<String> { self.strings().into_iter().find(|(key, _)| *key == 1).map(|(_, name)| name).filter(|name| !name.is_empty()) }
 }
 
-/// The text of a string linkage: UTF-16LE after `FF FD`, Latin-1 otherwise; trailing NULs dropped.
+/// The text of a string linkage (§B.7a): UTF-16LE after `FF FD`, 8-bit after `FF FE 01 00`
+/// (CONNECT) or without a marker (read as Latin-1); trailing NULs dropped.
 fn linkage_text(bytes: &[u8]) -> String {
     let text = match bytes {
         [0xFF, 0xFD, rest @ ..] => String::from_utf16_lossy(&rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()),
+        [0xFF, 0xFE, 0x01, 0x00, rest @ ..] => latin1(rest),
         _ => latin1(bytes),
     };
     text.trim_end_matches('\0').to_string()
@@ -169,14 +179,14 @@ pub fn split(stream: &[u8]) -> Result<(Vec<RawElement<'_>>, bool)> {
 
 /// The index after element `i` and its components, at most `end`. A top-level element owns
 /// all components that follow it; a nested one as many as its header counts (cells, text nodes,
-/// complex chains and shapes, B-spline curves). Other nested headers own nothing: their
-/// components are read as their siblings. B-spline headers also own their knot, pole and
-/// weight elements.
+/// complex chains and shapes, surfaces, solids, B-splines, meshes). Other nested headers own
+/// nothing: their components are read as their siblings. B-spline headers also own their knot,
+/// pole and weight elements.
 pub fn span(all: &[RawElement], i: usize, end: usize, depth: usize) -> usize {
     let e = all[i];
     let mut j = i + 1;
     if !e.complex() || depth > MAX_DEPTH { return j; }
-    let belongs = |c: &RawElement| c.component() || (e.kind() == 27 && matches!(c.kind(), 21 | 26 | 28));
+    let belongs = |c: &RawElement| c.component() || (matches!(e.kind(), 24 | 27) && matches!(c.kind(), 21 | 26 | 28));
     if depth == 0 {
         while j < end && belongs(&all[j]) { j += 1; }
     } else if let Some(count) = e.component_count() {
@@ -188,16 +198,30 @@ pub fn span(all: &[RawElement], i: usize, end: usize, depth: usize) -> usize {
     j
 }
 
+/// The streams of one model, inflated.
+pub struct ModelStreams {
+    /// The model ID: the hexadecimal digits of the storage name `#NNNNNN`.
+    pub id: u32,
+    /// The model is kept out of the model index (storage `Dgn-Nd`, §B.15).
+    pub hidden: bool,
+    /// The graphic elements (`Dgn^G`).
+    pub graphics: Vec<u8>,
+    /// The control elements (`Dgn^C`), which hold the reference attachments.
+    pub controls: Vec<u8>,
+    /// The model header (`Dgn~Mh`), still compressed.
+    pub header: Option<Vec<u8>>,
+}
+
 /// The streams of a V8 file the reader uses, inflated.
 pub struct Streams {
-    /// The graphic elements of the first design model (`Dgn-Md/#000000/Dgn^G`).
-    pub graphics: Vec<u8>,
+    /// Every model: the design models (`Dgn-Md`) by ID, then the hidden ones (`Dgn-Nd`).
+    pub models: Vec<ModelStreams>,
     /// The non-model elements (`Dgn^Nm`): level and colour tables, shared cell definitions.
     pub tables: Vec<u8>,
-    /// The model header (`Dgn-Md/#000000/Dgn~Mh`), still compressed.
-    pub header: Option<Vec<u8>>,
-    /// Models beside the first (storages `Dgn-Md/#00000N`).
-    pub further_models: usize,
+    /// The format revision from the file header (`Dgn~H`, §B.14).
+    pub revision: Option<u32>,
+    /// The application name from the OLE summary information.
+    pub application: Option<String>,
     /// Streams that could not be inflated completely.
     pub problems: Vec<&'static str>,
 }
@@ -226,24 +250,75 @@ fn element_stream(file: &CompoundFile, storage: Option<usize>, problems: &mut Ve
     out
 }
 
+/// The format revision (§B.14): `Dgn~H` is 20 bytes, then zlib data with the revision as the
+/// u32 at +0x118.
+fn file_revision(header: &[u8]) -> Option<u32> {
+    let mut unpacked = Vec::new();
+    inflate(header.get(20..)?, &mut unpacked, MAX_MODEL_HEADER).ok()?;
+    (unpacked.len() >= 0x11C).then(|| le32(&unpacked, 0x118))
+}
+
+/// Property 18 (the application name, a string) of an OLE property set stream ([MS-OLEPS]):
+/// the first property set's offset at byte 44; in the set, the number of properties at +4 and
+/// pairs of identifier and offset (from the set's start) from +8.
+fn application_name(stream: &[u8]) -> Option<String> {
+    if le16(stream, 0) != 0xFFFE { return None; }
+    let set = le32(stream, 44) as usize;
+    let count = (le32(stream, set.checked_add(4)?) as usize).min(256);
+    let at = (0..count).find_map(|k| (le32(stream, set + 8 + 8 * k) == 18).then(|| set + le32(stream, set + 12 + 8 * k) as usize))?;
+    // VT_LPSTR (0x1E): a length including the NUL, then the characters.
+    if le16(stream, at) != 0x1E { return None; }
+    let length = le32(stream, at + 4) as usize;
+    let bytes = stream.get(at + 8..stream.len().min(at.checked_add(8 + length)?))?;
+    Some(latin1(bytes).replace('\0', "")).filter(|s| !s.is_empty())
+}
+
+/// The models of a compound file: `(id, hidden, storage)`, design models by ID, then hidden ones.
+fn model_storages(file: &CompoundFile) -> Vec<(u32, bool, usize)> {
+    let mut out = Vec::new();
+    for (hidden, name) in [(false, "Dgn-Md"), (true, "Dgn-Nd")] {
+        let Some(models) = file.path(&[name]) else { continue };
+        for k in file.children(models) {
+            let entry = &file.entries[k];
+            let Some(id) = entry.name.strip_prefix('#').and_then(|hex| u32::from_str_radix(hex, 16).ok()) else { continue };
+            if entry.kind == STORAGE { out.push((id, hidden, k)); }
+        }
+    }
+    out.sort_unstable_by_key(|&(id, hidden, _)| (hidden, id));
+    out
+}
+
 /// Opens the compound file of a V8 design and inflates its element streams.
 pub fn streams(data: &[u8]) -> Result<Streams> {
     let file = CompoundFile::open(data)?;
-    let model = file.path(&["Dgn-Md", "#000000"]).ok_or("MicroStation DGN: this V8 file has no design model (Dgn-Md/#000000)")?;
-    // Only the first model is described yet: sheets and further design models are counted.
-    let further_models = file.path(&["Dgn-Md"]).map_or(0, |models| {
-        file.children(models).into_iter().filter(|&k| k != model && file.entries[k].kind == STORAGE).count()
-    });
+    let storages = model_storages(&file);
+    if !storages.iter().any(|m| !m.1) { return Err("MicroStation DGN: this V8 file has no design model (Dgn-Md)".into()); }
     let mut problems = Vec::new();
-    let graphics = element_stream(&file, file.child(model, "Dgn^G"), &mut problems);
+    let models = storages.into_iter().map(|(id, hidden, k)| ModelStreams {
+        id, hidden,
+        graphics: element_stream(&file, file.child(k, "Dgn^G"), &mut problems),
+        controls: element_stream(&file, file.child(k, "Dgn^C"), &mut problems),
+        header: file.child(k, "Dgn~Mh").map(|h| file.read(h)),
+    }).collect();
     let tables = element_stream(&file, file.path(&["Dgn^Nm"]), &mut problems);
-    let header = file.child(model, "Dgn~Mh").map(|k| file.read(k));
-    Ok(Streams { graphics, tables, header, further_models, problems })
+    let revision = file.path(&["Dgn~H"]).and_then(|k| file_revision(&file.read(k)));
+    let application = file.path(&["\u{5}SummaryInformation"]).and_then(|k| application_name(&file.read(k)));
+    Ok(Streams { models, tables, revision, application, problems })
 }
 
-/// Units and global origin from the model header (§B.5): zlib data of 4096 bytes, a 4-byte
-/// prefix and an element of type 66.
-fn model_units(packed: Option<&[u8]>) -> Option<(DVec3, Units)> {
+/// What a model header says (§B.5, §B.15).
+struct ModelHeader {
+    origin: DVec3,
+    units: Units,
+    name: Option<String>,
+    description: Option<String>,
+    three_d: bool,
+}
+
+/// The model header (§B.5, §B.15): zlib data of 4096 bytes, a 4-byte prefix and an element of
+/// type 66 with the units, the global origin, the 3D bit (+0x44) and the name, description and
+/// unit names as string linkages 1, 2, 19 and 20.
+fn model_header(packed: Option<&[u8]>) -> Option<ModelHeader> {
     let mut unpacked = Vec::new();
     inflate(packed?, &mut unpacked, MAX_MODEL_HEADER).ok()?;
     let e = RawElement { bytes: unpacked.get(0x1004..)? };
@@ -259,15 +334,29 @@ fn model_units(packed: Option<&[u8]>) -> Option<(DVec3, Units)> {
         1.0 / per_metre(0x50), 1.0 / per_metre(0x60), 1.0 / per_metre(0xE8),
     );
     let valid = |m: f64| Some(m).filter(|m| m.is_finite() && *m > 0.0).unwrap_or(1.0);
-    Some((origin, Units {
-        metres_per_uor,
-        metres_per_master: valid(1.0 / per_metre(0x50)),
-        metres_per_sub: valid(1.0 / per_metre(0x60)),
-        master_name: None,
-        sub_name: None,
-        stored: true,
-        description,
-    }))
+    Some(ModelHeader {
+        origin,
+        units: Units {
+            metres_per_uor,
+            metres_per_master: valid(1.0 / per_metre(0x50)),
+            metres_per_sub: valid(1.0 / per_metre(0x60)),
+            master_name: e.string(19),
+            sub_name: e.string(20),
+            stored: true,
+            description,
+        },
+        name: e.string(1),
+        description: e.string(2),
+        three_d: e.u32(0x44) & 1 != 0,
+    })
+}
+
+/// Units when a model has no usable header.
+fn assumed_units() -> Units {
+    Units {
+        metres_per_uor: 1.0, metres_per_master: 1.0, metres_per_sub: 1.0, master_name: None, sub_name: None, stored: false,
+        description: "none in the model header (1 UOR = 1 m assumed)".into(),
+    }
 }
 
 /// Levels from the level table (§B.6, §B.13): type 95 entries of kind 1, with the ID at +0x20,
@@ -287,22 +376,37 @@ fn levels(tables: &[RawElement]) -> Vec<Level> {
     levels.into_values().collect()
 }
 
-/// Reads a V8 design file: the first design model, levels, colours and shared cell definitions.
+/// A reference attachment (type 100 in `Dgn^C`, §B.20): the sequence number at +0x2C, origins
+/// at +0xA8 (reference side) and +0xC0 (this model), a row-major matrix at +0xD8, the scale at
+/// +0x120 and the file name in string linkage 3.
+fn reference(e: &RawElement, model: u32) -> Option<Reference> {
+    if e.len() < 0x128 { return None; }
+    let triple = |at: usize| -> Point { [e.f64(at), e.f64(at + 8), e.f64(at + 16)] };
+    Some(Reference {
+        number: e.u32(0x2C),
+        model: Some(model),
+        file_name: e.string(3).unwrap_or_default(),
+        logical_name: String::new(),
+        description: String::new(),
+        display: None,
+        missing: None,
+        reference_origin: triple(0xA8),
+        master_origin: triple(0xC0),
+        matrix: std::array::from_fn(|k| e.f64(0xD8 + 8 * k)),
+        scale: e.f64(0x120),
+        clip: Vec::new(),
+    })
+}
+
+/// Reads a V8 design file: every model, levels, colours, shared cell definitions and reference
+/// attachments.
 pub fn read(data: &[u8]) -> Result<Design> {
     let streams = streams(data)?;
     let mut skipped = Skipped::default();
-    for _ in 0..streams.further_models { skipped.add("Further model (not read)"); }
     for problem in &streams.problems { skipped.add(problem); }
-    let (graphics, broken) = split(&streams.graphics)?;
-    if broken { skipped.add("Malformed element stream (rest skipped)"); }
     let (tables, broken) = split(&streams.tables)?;
     if broken { skipped.add("Malformed element stream (rest skipped)"); }
-    let (origin, units) = model_units(streams.header.as_deref()).unwrap_or_else(|| (DVec3::ZERO, Units {
-        metres_per_uor: 1.0, metres_per_master: 1.0, metres_per_sub: 1.0, master_name: None, sub_name: None, stored: false,
-        description: "none in the model header (1 UOR = 1 m assumed)".into(),
-    }));
     let colors = tables.iter().filter(|e| e.kind() == 5 && e.level() == 1).find_map(|e| color_table(e.bytes, 0x22));
-    let three_d = graphics.iter().any(|e| e.graphic() && e.three_d());
 
     // Shared cell definitions (type 34 in the non-model elements) by name, the first of a name
     // wins; instances look the name up exactly, then in ASCII lower case.
@@ -334,24 +438,49 @@ pub fn read(data: &[u8]) -> Result<Design> {
         SharedCellDefinition { name: name.clone(), children }
     }).collect();
 
-    let mut elements = Vec::new();
-    let mut i = 0;
-    while i < graphics.len() {
-        let next = span(&graphics, i, graphics.len(), 0);
-        if graphics[i].graphic() { elements.extend(reader.element(&graphics, i, graphics.len(), 0, true)); }
-        i = next;
+    let mut models = Vec::new();
+    let mut references = Vec::new();
+    for m in &streams.models {
+        let (graphics, broken) = split(&m.graphics)?;
+        if broken { reader.skipped.add("Malformed element stream (rest skipped)"); }
+        let (controls, broken) = split(&m.controls)?;
+        if broken { reader.skipped.add("Malformed element stream (rest skipped)"); }
+        for e in controls.iter().filter(|e| e.kind() == 100) {
+            match reference(e, m.id) {
+                Some(r) => references.push(r),
+                None => reader.skipped.add("Malformed reference attachment"),
+            }
+        }
+        let header = model_header(m.header.as_deref());
+        let mut elements = Vec::new();
+        let mut i = 0;
+        while i < graphics.len() {
+            let next = span(&graphics, i, graphics.len(), 0);
+            if graphics[i].graphic() { elements.extend(reader.element(&graphics, i, graphics.len(), 0, true)); }
+            i = next;
+        }
+        // A 3D model has the bit in its header (§B.15) and 3D elements only.
+        let three_d = header.as_ref().is_some_and(|h| h.three_d) || graphics.iter().any(|e| e.graphic() && e.three_d());
+        let (origin, units, name, description) = match header {
+            Some(h) => (h.origin, h.units, h.name, h.description),
+            None => (DVec3::ZERO, assumed_units(), None, None),
+        };
+        models.push(Model { id: m.id, name, description, three_d, hidden: m.hidden, units, global_origin: point(origin), elements });
     }
+    let default = &models[0];
     Ok(Design {
         format: Format::V8,
-        three_d,
-        units,
-        global_origin: point(origin),
+        revision: streams.revision,
+        application: streams.application,
+        three_d: default.three_d,
+        units: default.units.clone(),
+        global_origin: default.global_origin,
         levels: levels(&tables),
         colors,
-        models: vec![Model { name: None, elements }],
         shared_cells,
-        references: Vec::new(),
+        references,
         skipped: reader.skipped.0,
+        models,
     })
 }
 
@@ -402,7 +531,11 @@ impl Reader {
         };
         let geometry = match e.kind() {
             // Cells keep their components in world coordinates; text nodes hold text elements.
-            2 => Geometry::Cell(Cell { name: e.name(), origin: None, transform: None, children: children(self) }),
+            // A smart solid or surface (§B.18) is a cell whose last component is Parasolid data
+            // (type 38, not graphic): its other components are the wireframe.
+            2 => Geometry::Cell(Cell {
+                name: e.name(), origin: None, transform: None, brep: all[i + 1..stop].iter().any(|c| c.kind() == 38), children: children(self),
+            }),
             7 => Geometry::TextNode {
                 number: if e.len() >= 0x70 { e.u32(0x6C) } else { 0 }, origin: None, line_spacing: None, children: children(self),
             },
@@ -428,7 +561,28 @@ impl Reader {
                 Some(g) => g,
                 None => { self.malformed(&e); return None; }
             },
+            18 | 19 => {
+                // Surfaces and solids (§B.16): the surface type at +0x70 (8: of revolution) and
+                // boundaries of (+0x6C) + 1 elements each.
+                let surface_type = e.u32(0x70);
+                Geometry::Surface(Surface {
+                    solid: e.kind() == 19, surface_type: surface_type.min(255) as u8, revolution: surface_type == 8,
+                    elements_per_boundary: (e.u32(0x6C) as usize).saturating_add(1).min(1024), children: children(self),
+                })
+            }
             22 => Geometry::PointString { points: e.vertices().into_iter().map(point).collect(), disjoint: e.h_bit() },
+            23 => match cone(&e) {
+                Some(g) => g,
+                None => { self.malformed(&e); return None; }
+            },
+            24 => match bspline_surface(&e, &all[i + 1..stop]) {
+                Some(g) => g,
+                None => { self.malformed(&e); return None; }
+            },
+            105 => match mesh(&all[i + 1..stop]) {
+                Some(g) => g,
+                None => { self.malformed(&e); return None; }
+            },
             33 => match dimension(&e) {
                 Some(g) => g,
                 None => { self.skipped.add("Dimension"); return None; }
@@ -495,18 +649,110 @@ fn bspline(header: RawElement, parts: &[RawElement]) -> Option<Geometry> {
     let doubles = |kind: u16| parts.iter().find(|p| p.kind() == kind).map(|p| (0..p.len().saturating_sub(0x20) / 8).map(|k| p.f64(0x20 + 8 * k)).collect::<Vec<_>>());
     let n = poles.len();
     let weights = doubles(28).map(|w| (0..n).map(|k| w.get(k).copied().filter(|w| *w > 0.0 && w.is_finite()).unwrap_or(1.0)).collect());
-    let ends_meet = poles.first() == poles.last();
-    let (periodic, interior) = match doubles(26) {
-        // A closed curve whose ends meet (such as the rational circle) is an open, clamped curve
-        // with the stored knots strictly between 0 and 1.
+    let (periodic, knots) = knot_rule(n, order, closed, poles.first() == poles.last(), doubles(26));
+    Some(Geometry::BSplineCurve(BSplineCurve { order, closed, periodic, rational, poles: poles.into_iter().map(point).collect(), weights, knots }))
+}
+
+/// Whether a B-spline direction of `n` poles is periodic, and its full knot vector, from the
+/// stored knots (§B.4 type 26): open curves store their interior knots; a closed curve whose ends
+/// meet (such as the rational circle) is an open, clamped curve with the stored knots strictly
+/// between 0 and 1; other closed curves are uniform periodic.
+fn knot_rule(n: usize, order: usize, closed: bool, ends_meet: bool, stored: Option<Vec<f64>>) -> (bool, Vec<f64>) {
+    let (periodic, interior) = match stored {
         knots if closed && ends_meet => (false, knots.map(|k| k.into_iter().take(n.saturating_sub(1)).filter(|&t| t > 0.0 && t < 1.0).collect())),
-        // Other closed curves: uniform periodic.
         _ if closed => (true, None),
-        // An open curve stores its interior knots.
         knots => (false, knots.map(|k| k.into_iter().take(n.saturating_sub(order)).collect())),
     };
-    let knots = if n >= order { knot_vector(n, order, interior, periodic) } else { Vec::new() };
-    Some(Geometry::BSplineCurve(BSplineCurve { order, closed, periodic, rational, poles: poles.into_iter().map(point).collect(), weights, knots }))
+    (periodic, if n >= order { knot_vector(n, order, interior, periodic) } else { Vec::new() })
+}
+
+/// The doubles of a knot or weight element: from +0x20 to its end.
+fn values(e: &RawElement) -> Vec<f64> { (0..e.len().saturating_sub(0x20) / 8).map(|k| e.f64(0x20 + 8 * k)).collect() }
+
+/// A B-spline surface (§B.16): u and v flags, pole and knot counts in the header, then one knot
+/// element (u knots, then v knots), one pole row per v (type 21) each followed by its weights
+/// (type 28) when rational. Boundaries are not applied.
+fn bspline_surface(header: &RawElement, parts: &[RawElement]) -> Option<Geometry> {
+    if header.len() < 0x90 { return None; }
+    let flags = |at: usize| { let f = header.u32(at); ((f & 0xF) as usize + 2, f & 0x100 != 0) };
+    let ((order_u, closed_u), (order_v, closed_v)) = (flags(0x6C), flags(0x7C));
+    let (count_u, count_v) = (header.u32(0x74) as usize, header.u32(0x84) as usize);
+    let mut rows: Vec<(Vec<DVec3>, Option<Vec<f64>>)> = Vec::new();
+    for p in parts {
+        match p.kind() {
+            21 => rows.push((p.vertices(), None)),
+            28 => if let Some((poles, weights)) = rows.last_mut() {
+                let stored = values(p);
+                *weights = Some((0..poles.len()).map(|k| stored.get(k).copied().filter(|w| *w > 0.0 && w.is_finite()).unwrap_or(1.0)).collect());
+            },
+            _ => {}
+        }
+    }
+    let nu = rows.first()?.0.len();
+    if nu < order_u || rows.len() < order_v || rows.iter().any(|r| r.0.len() != nu || !r.0.iter().all(|p| p.is_finite())) { return None; }
+    let knots = parts.iter().find(|p| p.kind() == 26).map(values);
+    let stored_u = knots.as_ref().map(|k| k.iter().take(count_u).copied().collect());
+    let stored_v = knots.as_ref().map(|k| k.iter().skip(count_u).take(count_v).copied().collect());
+    let ends_u = rows.iter().all(|r| r.0.first() == r.0.last());
+    let ends_v = rows.first().map(|r| &r.0) == rows.last().map(|r| &r.0);
+    let (periodic_u, knots_u) = knot_rule(nu, order_u, closed_u, ends_u, stored_u);
+    let (periodic_v, knots_v) = knot_rule(rows.len(), order_v, closed_v, ends_v, stored_v);
+    let weighted = rows.iter().any(|r| r.1.is_some());
+    Some(Geometry::BSplineSurface(BSplineSurface {
+        order_u, order_v, periodic_u, periodic_v,
+        weights: weighted.then(|| rows.iter().map(|r| r.1.clone().unwrap_or_else(|| vec![1.0; nu])).collect()),
+        rows: rows.into_iter().map(|r| r.0.into_iter().map(point).collect()).collect(),
+        knots_u, knots_v,
+        trimmed: header.u32(0x8C) > 0 || parts.iter().any(|p| p.kind() == 25),
+    }))
+}
+
+/// A cone or cylinder (§B.16): the orientation Q at +0x70, the centres at +0x90 and +0xB0 with
+/// their radii at +0xA8 and +0xC8; the circles lie in the plane of Q's first two axes.
+fn cone(e: &RawElement) -> Option<Geometry> {
+    if e.len() < 0xD0 { return None; }
+    let rotation = quaternion(e.f64(0x70), e.f64(0x78), e.f64(0x80), e.f64(0x88));
+    let center = |at: usize| DVec3::new(e.f64(at), e.f64(at + 8), e.f64(at + 16));
+    let (c1, c2, r1, r2) = (center(0x90), center(0xB0), e.f64(0xA8), e.f64(0xC8));
+    if !(c1.is_finite() && c2.is_finite() && r1.is_finite() && r2.is_finite() && rotation.is_finite()) { return None; }
+    Some(Geometry::Cone(Cone {
+        centers: [point(c1), point(c2)], radii: [r1, r2], x_axis: point(rotation.x_axis), y_axis: point(rotation.y_axis), capped: true,
+    }))
+}
+
+/// A mesh (§B.17) from its components: each array header (101) gives the role of the array
+/// that follows (2: vertices as doubles, type 103; 1: vertex indices as i32, type 102). Indices
+/// are 1-based, negative for an invisible edge, 0 closes a face; faces with an index beyond the
+/// vertices are left out.
+fn mesh(parts: &[RawElement]) -> Option<Geometry> {
+    let (mut role, mut vertices, mut indices) = (None, None, None);
+    let count = |p: &RawElement, size: usize| (p.u32(0x68) as usize).min(p.len().saturating_sub(0x78) / size);
+    for p in parts {
+        match p.kind() {
+            101 => role = Some(p.u32(0x74)),
+            102 => {
+                if role == Some(1) && indices.is_none() { indices = Some((0..count(p, 4)).map(|k| p.u32(0x78 + 4 * k) as i32).collect::<Vec<_>>()); }
+                role = None;
+            }
+            103 => {
+                if role == Some(2) && vertices.is_none() {
+                    let doubles: Vec<f64> = (0..count(p, 8)).map(|k| p.f64(0x78 + 8 * k)).collect();
+                    vertices = Some(doubles.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<Point>>());
+                }
+                role = None;
+            }
+            _ => {}
+        }
+    }
+    let (vertices, indices) = (vertices?, indices?);
+    if !vertices.iter().flatten().all(|v| v.is_finite()) { return None; }
+    let mut faces = Vec::new();
+    let mut face: Vec<usize> = Vec::new();
+    for index in indices.into_iter().chain([0]) {
+        if index != 0 { face.push(index.unsigned_abs() as usize - 1); continue; }
+        if face.len() >= 3 && face.iter().all(|&k| k < vertices.len()) { faces.push(std::mem::take(&mut face)); } else { face.clear(); }
+    }
+    (!faces.is_empty()).then_some(Geometry::Mesh(Mesh { vertices, faces }))
 }
 
 /// Text (§B.4, §B.8): its box from the origin (the lower left), as wide and high as stored.
@@ -621,12 +867,33 @@ mod tests {
 
     #[test]
     fn model_header_units() {
-        let f = File::new(3048.0, 39370.0, 12000.0, [-2147483647.0, -2147483647.0, 0.0]);
-        let (origin, units) = model_units(Some(&f.header)).unwrap();
-        assert_eq!(origin.x, -2147483647.0);
-        assert!((units.metres_per_uor - 1.0 / (3048.0 * 39370.0 / 12000.0)).abs() < 1e-15, "US survey foot");
-        assert_eq!(units.metres_per_sub, 0.001);
-        assert!(model_units(Some(b"no zlib")).is_none() && model_units(None).is_none());
+        let packed = model_header_stream(3048.0, 39370.0, 12000.0, [-2147483647.0, -2147483647.0, 0.0], Some("Sheet 1"), true);
+        let header = model_header(Some(&packed)).unwrap();
+        assert_eq!(header.origin.x, -2147483647.0);
+        assert!((header.units.metres_per_uor - 1.0 / (3048.0 * 39370.0 / 12000.0)).abs() < 1e-15, "US survey foot");
+        assert_eq!(header.units.metres_per_sub, 0.001);
+        assert_eq!((header.name.as_deref(), header.three_d), (Some("Sheet 1"), true));
+        assert_eq!(header.units.master_name.as_deref(), Some("m"));
+        assert!(model_header(Some(b"no zlib")).is_none() && model_header(None).is_none());
+    }
+
+    #[test]
+    fn file_revision_and_application() {
+        assert_eq!(file_revision(&file_header(202)), Some(202));
+        assert_eq!(file_revision(&[0; 80]), None);
+        assert_eq!(application_name(&summary_information("MicroStation v8.11.7.443")).as_deref(), Some("MicroStation v8.11.7.443"));
+        assert_eq!(application_name(&[0; 64]), None);
+    }
+
+    #[test]
+    fn linkage_lengths_count_the_words_after_the_header() {
+        // A string linkage of 28 words (header 0x101B), then a fill linkage `07 10` of 16 bytes.
+        let e = with_fill(element(6, 0x1000, 1, shown(0, 0), &counted(0, &[]), &[(1, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567")]), 4);
+        let raw = RawElement { bytes: &e };
+        let linkages = raw.linkages();
+        assert_eq!(linkages.iter().map(|(id, l)| (*id, l.len())).collect::<Vec<_>>(), [(STRING_LINKAGE, 56), (FILL_LINKAGE, 16)]);
+        assert_eq!(raw.fill_color(), Some(4));
+        assert_eq!(linkage_text(b"\xFF\xFE\x01\x00Level 1\0"), "Level 1", "CONNECT strings");
     }
 
     #[test]

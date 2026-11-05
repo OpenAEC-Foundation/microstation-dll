@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dgn_model::{kind_name, Design, Element, Format, Geometry, Point, BY_LEVEL_COLOR, BY_LEVEL_STYLE, BY_LEVEL_WEIGHT};
+use dgn_model::{kind_name, Design, Element, Format, Geometry, Model, Point, BY_LEVEL_COLOR, BY_LEVEL_STYLE, BY_LEVEL_WEIGHT};
 use glam::{DMat3, DVec3};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -78,6 +78,8 @@ pub struct Drawing {
     metres_per_uor: f64,
     origin: Point,
     references: Vec<String>,
+    /// Other facts: models, revision, application.
+    extra: Vec<(String, String)>,
     /// Points kept so far, to stop before shared cells multiply a drawing past the triangle limit.
     points: usize,
 }
@@ -112,21 +114,45 @@ pub struct Scene {
     pub info: Vec<(String, String)>,
 }
 
-/// Draws the first model of a design.
-pub fn draw(design: &Design) -> Drawing {
+/// Draws the default model of a design.
+pub fn draw(design: &Design) -> Drawing { draw_model(design, 0) }
+
+/// The name of a model for lists: its name, or `#id`.
+fn model_label(model: &Model) -> String {
+    let name = model.name.clone().unwrap_or_else(|| format!("#{}", model.id));
+    if model.hidden { format!("{name} (hidden)") } else { name }
+}
+
+/// Draws model `index` of a design (0 is the default model).
+pub fn draw_model(design: &Design, index: usize) -> Drawing {
+    let model = design.models.get(index);
+    let (units, origin) = model.map_or((&design.units, design.global_origin), |m| (&m.units, m.global_origin));
+    let mut extra = Vec::new();
+    if design.models.len() > 1 {
+        let names: Vec<String> = design.models.iter().map(model_label).collect();
+        extra.push(("DGN models".into(), format!("{}: {}", names.len(), names.join(", "))));
+        if let Some(m) = model { extra.push(("DGN model shown".into(), model_label(m))); }
+    }
+    if let Some(revision) = design.revision_label() { extra.push(("DGN file revision".into(), revision)); }
+    if let Some(application) = &design.application { extra.push(("DGN application".into(), application.clone())); }
     let mut drawer = Drawer {
         design,
+        metres_per_uor: units.metres_per_uor,
+        master_per_uor: units.metres_per_uor / units.metres_per_master,
+        origin: v(origin),
         out: Drawing {
             prims: Vec::new(), props: Vec::new(), counts: BTreeMap::new(), skipped: design.skipped.clone(),
             level_names: design.levels.iter().filter_map(|l| l.name.clone().map(|n| (l.id, n))).collect(),
-            three_d: design.three_d, format: design.format, units: design.units.description.clone(),
-            metres_per_uor: design.units.metres_per_uor, origin: design.global_origin,
-            references: design.references.iter().map(|r| if r.logical_name.is_empty() { r.file_name.clone() } else { format!("{} ({})", r.file_name, r.logical_name) }).collect(),
+            three_d: model.map_or(design.three_d, |m| m.three_d), format: design.format, units: units.description.clone(),
+            metres_per_uor: units.metres_per_uor, origin,
+            references: design.references.iter().filter(|r| r.model.is_none_or(|m| model.is_some_and(|model| model.id == m)))
+                .map(|r| if r.logical_name.is_empty() { r.file_name.clone() } else { format!("{} ({})", r.file_name, r.logical_name) }).collect(),
+            extra,
             points: 0,
         },
         next_id: 0, placement: (DMat3::IDENTITY, DVec3::ZERO), instance_level: None, active: Vec::new(), visits: 0, measures: Vec::new(), cell_fill: None,
     };
-    if let Some(model) = design.models.first() {
+    if let Some(model) = model {
         for e in &model.elements { drawer.top_level(e); }
     }
     drawer.out
@@ -190,6 +216,7 @@ impl Drawing {
             ("DGN skipped elements".into(), if skipped.is_empty() { "0".into() } else { skipped }),
         ];
         if !self.references.is_empty() { info.push(("DGN reference files".into(), self.references.join("; "))); }
+        info.extend(self.extra.iter().cloned());
         info
     }
 
@@ -285,10 +312,15 @@ fn text_box(origin: DVec3, x: DVec3, y: DVec3) -> Vec<DVec3> {
     vec![origin, origin + x, origin + x + y, origin + y, origin]
 }
 
-/// The points (design coordinates) of a line-like geometry, and whether it is closed.
+/// The points (design coordinates) of a line-like geometry, and whether it is closed; complex
+/// chains and shapes join the points of their components.
 pub(crate) fn curve_points(geometry: &Geometry) -> Option<(Vec<DVec3>, bool)> {
     let points = |p: &[Point]| p.iter().map(|&p| v(p)).collect::<Vec<_>>();
     match geometry {
+        Geometry::Complex { closed, children } => {
+            let joined: Vec<DVec3> = children.iter().filter_map(|c| curve_points(&c.geometry)).flat_map(|(points, _)| points).collect();
+            (!joined.is_empty()).then_some((joined, *closed))
+        }
         Geometry::Line { points: p } => Some((points(p), false)),
         Geometry::LineString { points: p, closed } => Some((points(p), *closed)),
         Geometry::Curve { points: p } => Some((akima(&points(p)), false)),
@@ -300,6 +332,10 @@ pub(crate) fn curve_points(geometry: &Geometry) -> Option<(Vec<DVec3>, bool)> {
 
 struct Drawer<'a> {
     design: &'a Design,
+    /// Units and global origin of the model being drawn.
+    metres_per_uor: f64,
+    master_per_uor: f64,
+    origin: DVec3,
     out: Drawing,
     next_id: u64,
     /// Placement of the shared cell definition being drawn: design point = matrix · point + offset.
@@ -364,6 +400,7 @@ impl Drawer<'_> {
                 if !by_level.is_empty() { props["By level"] = by_level.join(", ").into(); }
                 if let Some(fill) = e.fill { props["Fill colour index"] = self.design.resolve_color(fill, level).into(); }
                 if let Some(name) = cell_name { props["Cell"] = name.into(); }
+                if matches!(&e.geometry, Geometry::Cell(c) if c.brep) { props["Smart solid"] = "wireframe shown (Parasolid B-rep not read)".into(); }
                 props
             }
         };
@@ -385,7 +422,7 @@ impl Drawer<'_> {
         let level = self.level(e);
         let symbology = design.resolve(e.symbology, level);
         let color = fill.map_or(symbology.color, |fill| design.resolve_color(fill, level));
-        let (origin, scale) = (v(design.global_origin), design.units.metres_per_uor);
+        let (origin, scale) = (self.origin, self.metres_per_uor);
         self.out.push(id, level, design.rgb(color), symbology.weight.min(31) as u8, shape, |p| (matrix * p + offset - origin) * scale);
     }
 
@@ -466,8 +503,16 @@ impl Drawer<'_> {
                     if point != foot { self.push(e, id, DShape::Stroke(vec![v(point), v(foot)])); }
                 }
                 self.push(e, id, DShape::Stroke(d.feet.iter().map(|&p| v(p)).collect()));
-                let master_per_uor = self.design.units.metres_per_uor / self.design.units.metres_per_master;
+                let master_per_uor = self.master_per_uor;
                 self.measures.extend(d.distances.iter().map(|d| d * master_per_uor));
+            }
+            Geometry::Mesh(m) => {
+                // Each face as a fan of triangles.
+                let valid = |face: &&Vec<usize>| face.len() >= 3 && face.iter().all(|&i| i < m.vertices.len());
+                let triangles = m.faces.iter().filter(valid).flat_map(|face| {
+                    (1..face.len() - 1).map(move |k| [face[0], face[k], face[k + 1]].map(|i| v(m.vertices[i])))
+                }).collect();
+                self.push(e, id, DShape::Faces(triangles));
             }
             Geometry::SharedCell(s) => self.shared_cell(e, s, id, depth, texts),
         }
@@ -475,9 +520,19 @@ impl Drawer<'_> {
 
     /// Surfaces and solids of projection: faces between equal boundary outlines, capped for a
     /// solid. Others (surfaces of revolution, unequal boundaries) are drawn as their outlines.
+    /// A boundary is a run of boundary elements (class 0) of the stored length, joined.
     fn surface(&mut self, e: &Element, s: &dgn_model::Surface, id: u64) {
         let lines: Vec<(&Element, Vec<DVec3>)> = s.children.iter().filter_map(|c| curve_points(&c.geometry).map(|(points, _)| (c, points))).collect();
-        let boundaries: Vec<&Vec<DVec3>> = lines.iter().filter(|(c, _)| c.class == 0).map(|(_, points)| points).collect();
+        let edges: Vec<&Vec<DVec3>> = lines.iter().filter(|(c, _)| c.class == 0).map(|(_, points)| points).collect();
+        let joined: Vec<Vec<DVec3>> = edges.chunks(s.elements_per_boundary.max(1)).map(|run| {
+            let mut boundary: Vec<DVec3> = Vec::new();
+            for points in run {
+                let skip = usize::from(boundary.last().is_some_and(|last| points.first() == Some(last)));
+                boundary.extend(&points[skip..]);
+            }
+            boundary
+        }).collect();
+        let boundaries: Vec<&Vec<DVec3>> = joined.iter().collect();
         let ruled = !s.revolution && boundaries.len() >= 2 && boundaries.windows(2).all(|pair| pair[0].len() == pair[1].len() && pair[0].len() >= 2);
         if !ruled {
             if s.revolution { self.out.skip("Surface of revolution (outline drawn)"); }
