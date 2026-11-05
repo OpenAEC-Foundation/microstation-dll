@@ -4,6 +4,8 @@ members = [
     "crates/dgn-model",
     "crates/dgn-read",
     "crates/dgn-export",
+    "crates/dgn-ffi",
+    "crates/dgn-cli",
 ]
 
 [workspace.package]

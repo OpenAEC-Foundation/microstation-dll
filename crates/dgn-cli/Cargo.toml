@@ -1,0 +1,21 @@
+[package]
+name = "dgn-cli"
+description = "Command line front end of the DGN reader: info, dump, JSON and OBJ export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dgn"
+path = "src/main.rs"
+
+[dependencies]
+dgn-model.workspace = true
+dgn-read.workspace = true
+dgn-export.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dgn-read = { workspace = true, features = ["synth"] }
