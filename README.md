@@ -32,7 +32,7 @@ maintainers (see "Legal" below).
 
 ## Version support
 
-From the clean-room specification, `SPEC_v0.2.md` §C (sample files measured by the analysis
+From the clean-room specification, `SPEC_v0.3.md` §C (sample files measured by the analysis
 team; this repository contains none). ✓ read and tested, ~ partly, – no sample of that version
 yet (read the same way, untested), ✗ not specified yet: skipped and counted.
 
@@ -52,16 +52,19 @@ yet (read the same way, untested), ✗ not specified yet: skipped and counted.
 | Surface / solid of revolution | n/a | ~ outlines | – | – | ~ outlines |
 | Cone / cylinder | n/a | ✓ (ISFF) | – | – | ✓ |
 | Mesh (105) | n/a | n/a | – | – | ✓ |
-| Smart solid / surface (Parasolid B-rep) | n/a | n/a | – | ~ wireframe | ~ wireframe |
+| Smart solid / surface (Parasolid B-rep: counted, not read) | n/a | n/a | – | ~ wireframe | ~ wireframe |
 | Dimension (33) | ✗ | ✗ | ~ 2D linear | ~ 2D linear | – |
-| Multi-line (36), tag (37), raster | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Raster in the design (87/88: formats 1, 2, 9) | ~ (ISFF) | ~ (ISFF) | ~ | ~ | ✓ |
+| Multi-line (36), tag (37), raster attachments | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Several models (design models, sheets, `.cel` cells, hidden models) | n/a | n/a | ✓ | ✓ | ✓ |
-| Reference attachments (as data; the referenced file is not loaded) | ✓ (ISFF) | ✓ (ISFF) | – | ~ | – |
+| Attachments of other models of the same file (drawn in place) | n/a | n/a | ~ | ~ | ✓ |
+| Reference attachments of other files (as data; the file is not loaded) | ✓ (ISFF) | ✓ (ISFF) | – | ~ | – |
 | Format revision, writing application | n/a | n/a | ✓ | ✓ | ✓ |
 
 MicroStation 2023 to 2025 files have not been seen without OpenRoads; OpenRoads Designer 2024
 writes revision 202 like CONNECT. An unknown, higher revision is read the same way and reported.
-Extended colours (256 and up) draw white; custom line styles draw solid.
+Extended colours (256 and up) draw white; custom line styles draw solid; text draws as its box.
+Negative V7 text size multipliers mirror the text (SPEC_v0.3 §A.6).
 
 ## Use
 
