@@ -1,0 +1,18 @@
+[package]
+name = "dgn-read"
+description = "Reader of MicroStation design files: V7 (Intergraph ISFF) and V8 (OLE2 compound file) to the neutral dgn-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dgn-model.workspace = true
+flate2.workspace = true
+glam.workspace = true
+
+[features]
+# Writers of synthetic V7 and V8 design files built from the specification, for tests (here and
+# in dependent crates); no sample files are needed.
+synth = []

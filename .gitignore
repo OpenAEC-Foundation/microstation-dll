@@ -1,0 +1,25 @@
+# MicroStation files: never commit (see README, "Test data")
+*.dgn
+*.DGN
+*.cel
+*.dgnlib
+*.rdl
+*.i.dgn
+samples/
+exports/
+
+# Build output
+target/
+*.dll
+*.pdb
+*.lib
+*.exp
+*.so
+*.dylib
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

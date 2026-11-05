@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dgn-model",
+    "crates/dgn-read",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+publish = false
+rust-version = "1.85"
+
+[workspace.dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+glam = "0.30"
+earcutr = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dgn-model = { path = "crates/dgn-model" }
+dgn-read = { path = "crates/dgn-read" }
+dgn-export = { path = "crates/dgn-export" }
+
+[profile.release]
+lto = "thin"
