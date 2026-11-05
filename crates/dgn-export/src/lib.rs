@@ -120,7 +120,19 @@ pub fn draw(design: &Design) -> Drawing { draw_model(design, 0) }
 /// The name of a model for lists: its name, or `#id`.
 fn model_label(model: &Model) -> String {
     let name = model.name.clone().unwrap_or_else(|| format!("#{}", model.id));
-    if model.hidden { format!("{name} (hidden)") } else { name }
+    match (model.sheet, model.hidden) {
+        (true, true) => format!("{name} (sheet, hidden)"),
+        (true, false) => format!("{name} (sheet)"),
+        (false, true) => format!("{name} (hidden)"),
+        (false, false) => name,
+    }
+}
+
+/// A reference attachment for lists: the file, or the attached model of this file, and the
+/// logical name.
+fn reference_label(r: &dgn_model::Reference) -> String {
+    let target = if r.file_name.is_empty() { format!("model {}", r.model_name.as_deref().unwrap_or("?")) } else { r.file_name.clone() };
+    if r.logical_name.is_empty() { target } else { format!("{target} ({})", r.logical_name) }
 }
 
 /// Draws model `index` of a design (0 is the default model).
@@ -146,14 +158,16 @@ pub fn draw_model(design: &Design, index: usize) -> Drawing {
             three_d: model.map_or(design.three_d, |m| m.three_d), format: design.format, units: units.description.clone(),
             metres_per_uor: units.metres_per_uor, origin,
             references: design.references.iter().filter(|r| r.model.is_none_or(|m| model.is_some_and(|model| model.id == m)))
-                .map(|r| if r.logical_name.is_empty() { r.file_name.clone() } else { format!("{} ({})", r.file_name, r.logical_name) }).collect(),
+                .map(reference_label).collect(),
             extra,
             points: 0,
         },
         next_id: 0, placement: (DMat3::IDENTITY, DVec3::ZERO), instance_level: None, active: Vec::new(), visits: 0, measures: Vec::new(), cell_fill: None,
+        models: model.map(|m| vec![m.id]).unwrap_or_default(), reference: None,
     };
     if let Some(model) = model {
         for e in &model.elements { drawer.top_level(e); }
+        drawer.references(model);
     }
     drawer.out
 }
@@ -332,6 +346,10 @@ pub(crate) fn curve_points(geometry: &Geometry) -> Option<(Vec<DVec3>, bool)> {
 
 struct Drawer<'a> {
     design: &'a Design,
+    /// The models being drawn, the shown one first, then those attached by reference.
+    models: Vec<u32>,
+    /// The reference attachment whose model is being drawn.
+    reference: Option<String>,
     /// Units and global origin of the model being drawn.
     metres_per_uor: f64,
     master_per_uor: f64,
@@ -406,6 +424,7 @@ impl Drawer<'_> {
         };
         if e.graphic_group != 0 { props["Graphic group"] = e.graphic_group.into(); }
         if !texts.is_empty() { props["Text"] = texts.join("\n").into(); }
+        if let Some(reference) = &self.reference { props["Reference"] = reference.clone().into(); }
         if !self.measures.is_empty() {
             let values: Vec<String> = self.measures.iter().map(|v| ((v * 1e6).round() / 1e6).to_string()).collect();
             props["Measured (master units)"] = values.join("; ").into();
@@ -515,7 +534,57 @@ impl Drawer<'_> {
                 self.push(e, id, DShape::Faces(triangles));
             }
             Geometry::SharedCell(s) => self.shared_cell(e, s, id, depth, texts),
+            Geometry::Raster(r) => self.raster(e, r, id),
         }
+    }
+
+    /// The models of this file attached to `model` by reference (§B.20): their elements placed by
+    /// the attachment (`origin in this model + scale · matrix · (point - origin in the attached
+    /// model)`), each top-level element pickable. A model attached again inside itself is not
+    /// drawn twice.
+    fn references(&mut self, model: &Model) {
+        let design = self.design;
+        for r in design.references.iter().filter(|r| r.model == Some(model.id) && r.file_name.is_empty()) {
+            let target = r.model_name.as_ref().and_then(|name| design.models.iter().find(|m| m.name.as_ref() == Some(name)));
+            let Some(target) = target else { self.out.skip("Reference to a model that is not in the file"); continue };
+            if self.models.contains(&target.id) { self.out.skip("Reference that attaches itself"); continue; }
+            let matrix = DMat3::from_cols_array(&r.matrix).transpose() * r.scale;
+            if !matrix.is_finite() { self.out.skip("Malformed reference attachment"); continue; }
+            let saved = (self.placement, self.reference.take());
+            let (outer, offset) = self.placement;
+            self.placement = (outer * matrix, outer * (v(r.master_origin) - matrix * v(r.reference_origin)) + offset);
+            self.reference = Some(reference_label(r));
+            self.models.push(target.id);
+            *self.out.counts.entry("Reference model").or_default() += 1;
+            for e in &target.elements { self.top_level(e); }
+            self.references(target);
+            self.models.pop();
+            (self.placement, self.reference) = saved;
+        }
+    }
+
+    /// A raster as faces: each run of equal pixels in a row one rectangle, in the pixel's colour;
+    /// transparent pixels left out.
+    fn raster(&mut self, e: &Element, r: &dgn_model::Raster, id: u64) {
+        let (width, height) = (r.width as usize, r.height as usize);
+        if r.pixels.len() != width * height || r.pixel_size.is_nan() || r.pixel_size <= 0.0 { return; }
+        let (o, size) = (v(r.origin), r.pixel_size);
+        let mut by_color: BTreeMap<u8, Vec<[DVec3; 3]>> = BTreeMap::new();
+        for (y, row) in r.pixels.chunks_exact(width).enumerate() {
+            let mut x = 0;
+            while x < width {
+                let color = row[x];
+                let end = x + row[x..].iter().take_while(|&&c| c == color).count();
+                if Some(color) != r.transparent {
+                    let (x0, x1) = (o.x + x as f64 * size, o.x + end as f64 * size);
+                    let (y0, y1) = (o.y - (y + 1) as f64 * size, o.y - y as f64 * size);
+                    let [a, b, c, d] = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(px, py)| DVec3::new(px, py, o.z));
+                    by_color.entry(color).or_default().extend([[a, b, c], [a, c, d]]);
+                }
+                x = end;
+            }
+        }
+        for (color, faces) in by_color { self.push_filled(e, id, DShape::Faces(faces), Some(color.into())); }
     }
 
     /// Surfaces and solids of projection: faces between equal boundary outlines, capped for a

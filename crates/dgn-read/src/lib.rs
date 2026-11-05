@@ -27,6 +27,7 @@ use glam::{DMat3, DQuat};
 pub mod cfb;
 pub mod v7;
 pub mod v8;
+mod raster;
 mod zlib;
 
 #[cfg(any(test, feature = "synth"))]
@@ -36,8 +37,9 @@ pub use zlib::inflate;
 
 /// Elements read at most from one file.
 pub const MAX_ELEMENTS: usize = 2_000_000;
-/// Complex elements nested deeper than this are skipped.
-pub const MAX_DEPTH: usize = 16;
+/// Complex elements nested deeper than this are skipped: a safety net, real files nest at most
+/// 4 deep (§B.3).
+pub const MAX_DEPTH: usize = 64;
 /// The OLE2 compound file signature that starts every V8 file.
 pub const OLE_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Fixed-point unit of V7 quaternions, B-spline knots and weights: 2^31 - 1.

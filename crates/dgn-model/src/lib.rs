@@ -117,6 +117,8 @@ pub struct Model {
     pub three_d: bool,
     /// V8: a model the file keeps out of its model index (storage `Dgn-Nd`).
     pub hidden: bool,
+    /// V8: a sheet model (model header +0x22 = 1), otherwise a design model.
+    pub sheet: bool,
     pub units: Units,
     /// The global origin in UOR.
     pub global_origin: Point,
@@ -183,6 +185,24 @@ pub enum Geometry {
     Dimension(Dimension),
     /// Type 105 with its arrays (V8): faces between vertices.
     Mesh(Mesh),
+    /// Type 87 with its scan lines (88): an image of colour indices.
+    Raster(Raster),
+}
+
+/// A raster image: pixels in rows from the top, each `pixel_size` UOR square, the upper left
+/// corner at `origin`, rows running along +x, successive rows towards -y.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Raster {
+    pub origin: Point,
+    pub pixel_size: f64,
+    pub width: u32,
+    pub height: u32,
+    /// The stored format: 1 (one bit per pixel), 2 (one colour index per pixel), 9 (run lengths).
+    pub format: u8,
+    /// A colour index per pixel, `width × height`, row by row from the top.
+    pub pixels: Vec<u8>,
+    /// Pixels of this colour index are not drawn (a transparent background).
+    pub transparent: Option<u8>,
 }
 
 /// A line of text. Its box runs from `origin` (the lower left) along `x_axis` and `y_axis`.
@@ -321,7 +341,10 @@ pub struct Reference {
     /// V8: the model the attachment belongs to.
     pub model: Option<u32>,
     /// As stored: may be a full or ProjectWise path; look for the bare file name beside the design.
+    /// Empty for an attachment of another model of the same file.
     pub file_name: String,
+    /// V8: the name of the attached model (in the referenced file, or in this one).
+    pub model_name: Option<String>,
     pub logical_name: String,
     pub description: String,
     /// V7: displayed (the display bit of the file displayer options).
@@ -454,7 +477,7 @@ pub fn kind_name(kind: u16) -> &'static str {
         18 => "Surface", 19 => "Solid", 21 => "B-spline poles", 22 => "Point string", 23 => "Cone",
         24 => "B-spline surface", 25 => "B-spline boundary", 26 => "B-spline knots", 27 => "B-spline curve",
         28 => "B-spline weights", 33 => "Dimension", 34 => "Shared cell definition", 35 => "Shared cell",
-        36 => "Multi-line", 37 => "Tag", 38 => "Parasolid data", 87 => "Raster header", 88 => "Raster data",
+        36 => "Multi-line", 37 => "Tag", 38 => "Parasolid data", 87 => "Raster", 88 => "Raster data",
         100 => "Reference attachment", 105 => "Mesh",
         _ => "Unknown element",
     }

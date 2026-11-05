@@ -38,8 +38,8 @@ fn v8_models_revision_and_application() {
     // A 2D sheet (ID 0x1a) with a line of 5 m, and a hidden model (Dgn-Nd) with nothing.
     let mut sheet = Vec::new();
     push(&mut sheet, element(3, 0x1000, 1, shown(0, 0), &doubles(&[0.0, 0.0, 5000.0, 0.0]), &[]));
-    f.models.push(ExtraModel { id: 0x1a, hidden: false, header: model_header_stream(1000.0, 1.0, 1.0, [0.0; 3], Some("Sheet"), false), graphics: sheet });
-    f.models.push(ExtraModel { id: 2, hidden: true, header: model_header_stream(1000.0, 1.0, 1.0, [0.0; 3], Some("Profile"), false), graphics: Vec::new() });
+    f.models.push(ExtraModel { id: 0x1a, hidden: false, header: model_header_stream(1000.0, 1.0, 1.0, [0.0; 3], Some("Sheet"), false), graphics: sheet, controls: Vec::new() });
+    f.models.push(ExtraModel { id: 2, hidden: true, header: model_header_stream(1000.0, 1.0, 1.0, [0.0; 3], Some("Profile"), false), graphics: Vec::new(), controls: Vec::new() });
     let design = dgn_read::read(&f.bytes()).unwrap();
     let models: Vec<(u32, &str, bool, bool)> = design.models.iter().map(|m| (m.id, m.name.as_deref().unwrap(), m.three_d, m.hidden)).collect();
     assert_eq!(models, [(0, "Default", true, false), (0x1a, "Sheet", false, false), (2, "Profile", false, true)]);
@@ -131,7 +131,7 @@ fn v8_smart_solids_draw_their_wireframe() {
     assert!(cell.brep && cell.children.len() == 1);
     let s = scene(&design);
     assert_eq!(info(&s, "DGN elements"), "Cell: 1");
-    assert_eq!(info(&s, "DGN skipped elements"), "0");
+    assert_eq!(info(&s, "DGN skipped elements"), "B-rep (not supported, wireframe shown): 1");
     assert!(s.layers[0].props[0].1.contains("\"Smart solid\""), "{}", s.layers[0].props[0].1);
 }
 

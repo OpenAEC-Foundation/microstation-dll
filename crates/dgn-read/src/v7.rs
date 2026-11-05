@@ -44,6 +44,10 @@ impl RawElement<'_> {
         if exponent == 0 { return 0.0; }
         f64::from_bits((u & (1 << 63)) | ((exponent + 894) << 52) | ((u & ((1 << 55) - 1)) >> 3))
     }
+    /// Range corner `at` (0: low, 3: high) in UOR: unsigned longs offset by 2^31 (§A.2).
+    pub fn range(&self, at: usize) -> [f64; 3] {
+        std::array::from_fn(|k| f64::from(self.ulong(2 + 2 * (at + k))) - 2_147_483_648.0)
+    }
     pub fn properties(&self) -> u16 { self.word(16) }
     pub fn class(&self) -> u16 { self.properties() & 0xF }
     /// The H bit: hole, orphan cell, infinite line or disjoint point string.
@@ -204,6 +208,7 @@ pub fn span(all: &[RawElement], i: usize, depth: usize) -> usize {
             }
         }
         24 | 27 => while j < all.len() && matches!(all[j].kind, 21 | 25 | 26 | 28) { j += 1 },
+        87 => while j < all.len() && all[j].kind == 88 && all[j].complex { j += 1 },
         _ => {}
     }
     j
@@ -243,7 +248,7 @@ pub fn read(data: &[u8]) -> Result<Design> {
         levels: Vec::new(),
         colors: header.colors.clone(),
         models: vec![Model {
-            id: 0, name: None, description: None, three_d: header.three_d, hidden: false, units: header.units.clone(), global_origin: origin, elements: model,
+            id: 0, name: None, description: None, three_d: header.three_d, hidden: false, sheet: false, units: header.units.clone(), global_origin: origin, elements: model,
         }],
         shared_cells: reader.definitions,
         references,
@@ -263,6 +268,7 @@ fn reference(e: &RawElement) -> Option<Reference> {
         number: e.bytes[103].into(),
         model: None,
         file_name: e.text(38, file_chars),
+        model_name: None,
         logical_name: e.text(2 * 147, usize::from(e.word(146)).min(22)),
         description: e.text(2 * 159, usize::from(e.word(158)).min(42)),
         display: Some(e.word(53) & 0x2 != 0),
@@ -410,6 +416,10 @@ impl Reader<'_> {
                 Some(g) => g,
                 None => { self.skipped.add("Malformed B-spline surface"); return None; }
             },
+            87 => match raster_image(&e, &all[i + 1..span(all, i, 0)]) {
+                Some(g) => g,
+                None => { self.skipped.add("Malformed element (Raster)"); return None; }
+            },
             35 => match self.shared_cell(&e) {
                 Some(g) => g,
                 None => { self.skipped.add("Malformed element (Shared cell)"); return None; }
@@ -468,11 +478,16 @@ impl Reader<'_> {
         let count_byte = 2 * (origin_at + h.point_words());
         let count = *e.bytes.get(count_byte)?;
         let text = latin1(&e.bytes.iter().skip(count_byte + 2).take(usize::from(count)).copied().collect::<Vec<_>>());
-        // The basic character cell is 6 UOR; multipliers are thousandths.
-        let height = f64::from(e.ulong(21)) / 1000.0 * 6.0;
-        let width = f64::from(e.ulong(19)) / 1000.0 * 6.0 * f64::from(count).max(1.0);
+        // The basic character cell is 6 UOR; multipliers are thousandths. They are signed, a
+        // negative one mirrors the text (§A.6, v0.3), unless read unsigned the size still fits the
+        // element's range (as some writers store large unsigned values).
+        let (low, high) = (e.range(0), e.range(3));
+        let characters = f64::from(count).max(1.0);
+        let (height, flip_y) = multiplier(e.ulong(21), 1.0, high[1] - low[1]);
+        let (width, flip_x) = multiplier(e.ulong(19), characters, high[0] - low[0]);
+        let sign = |flip: bool| if flip { -1.0 } else { 1.0 };
         Some(Geometry::Text(Text {
-            origin: point(h.point(e, origin_at)), x_axis: point(rotation.x_axis), y_axis: point(rotation.y_axis), width, height,
+            origin: point(h.point(e, origin_at)), x_axis: point(rotation.x_axis * sign(flip_x)), y_axis: point(rotation.y_axis * sign(flip_y)), width, height,
             text: Some(text), font: e.bytes[36].into(), justification: e.bytes[37].into(),
         }))
     }
@@ -548,6 +563,34 @@ fn knots(element: Option<&RawElement>, count: usize, skip: usize) -> Option<Vec<
     let e = element?;
     let values: Vec<f64> = (0..count).map(|k| f64::from(e.long(18 + 2 * (skip + k))) / UNIT).collect();
     (e.words() >= 18 + 2 * (skip + count)).then_some(values)
+}
+
+/// A raster (ISFF types 87 and 88): flags at word 20 (format in bits 3 to 7, transparent bit 9),
+/// foreground and background at bytes 42 and 43, extents at words 22 and 23, UOR per pixel (a
+/// double) at word 30, the origin (upper left, longs) at word 34; each scan line its flags at word
+/// 18, its x and y offset at words 20 and 21, its number of pixels at word 22 and the pixel data
+/// from word 23.
+fn raster_image(header: &RawElement, lines: &[RawElement]) -> Option<Geometry> {
+    if header.words() < 40 { return None; }
+    let flags = header.word(20);
+    let mut image = crate::raster::Image::new(header.word(22).into(), header.word(23).into(), (flags >> 3) as u8 & 0x1F, header.bytes[42], header.bytes[43])?;
+    for line in lines.iter().filter(|l| l.words() >= 23) {
+        image.row(line.word(21).into(), line.word(20).into(), usize::from(line.word(22)), &line.bytes[46..]);
+    }
+    let pixel_size = header.double(30);
+    if !(pixel_size.is_finite() && pixel_size > 0.0) { return None; }
+    let origin = [34, 36, 38].map(|w| f64::from(header.long(w)));
+    Some(Geometry::Raster(image.finish(origin, pixel_size, flags & 0x200 != 0)))
+}
+
+/// A text size from a size multiplier for `characters` characters, and whether the text is
+/// mirrored that way (§A.6, v0.3): read unsigned when it is not negative as signed, or when the
+/// unsigned size is at most 1.05 times the range extent plus 2 UOR; otherwise its magnitude as
+/// signed, mirrored.
+fn multiplier(raw: u32, characters: f64, extent: f64) -> (f64, bool) {
+    let unsigned = f64::from(raw) / 1000.0 * 6.0 * characters;
+    if (raw as i32) >= 0 || unsigned <= 1.05 * extent + 2.0 { return (unsigned, false); }
+    (f64::from((raw as i32).unsigned_abs()) / 1000.0 * 6.0 * characters, true)
 }
 
 /// Order, closed and rational flags from a B-spline flags word.

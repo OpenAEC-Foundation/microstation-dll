@@ -218,7 +218,13 @@ pub mod v8 {
     /// `numerator / denominator` storage units per metre, the global origin in UOR, the master
     /// unit the metre (named `m`), the sub unit the millimetre (`mm`), the model's name and 3D bit.
     pub fn model_header_stream(uor: f64, numerator: f64, denominator: f64, origin: [f64; 3], name: Option<&str>, three_d: bool) -> Vec<u8> {
+        model_header_stream_with(uor, numerator, denominator, origin, name, three_d, false)
+    }
+
+    /// [`model_header_stream`] of a sheet model (+0x22 = 1) when `sheet`.
+    pub fn model_header_stream_with(uor: f64, numerator: f64, denominator: f64, origin: [f64; 3], name: Option<&str>, three_d: bool, sheet: bool) -> Vec<u8> {
         let mut e = vec![0u8; 0x100];
+        e[0x22..0x24].copy_from_slice(&u16::from(sheet).to_le_bytes());
         e[..2].copy_from_slice(&66u16.to_le_bytes());
         e[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
         e[8..12].copy_from_slice(&0x80u32.to_le_bytes());
@@ -305,6 +311,44 @@ pub mod v8 {
             header(1, 1),
             array(102, indices.len(), indices.iter().flat_map(|i| i.to_le_bytes()).collect()),
         ]
+    }
+
+    /// An attachment (type 100, §B.20) of the model `model` of the same file: no file name, the
+    /// logical name in string linkage 4 and the model's name in 21, placed at `at` (UOR) with
+    /// identity matrix and the stored `scale`.
+    pub fn model_attachment(number: u32, model: &str, logical: &str, at: [f64; 3], scale: f64) -> Vec<u8> {
+        let mut data = vec![0u8; 0xA8 - 0x68];
+        data.extend(doubles(&[0.0; 3]));
+        data.extend(doubles(&at));
+        data.extend(doubles(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, scale]));
+        let mut e = element(100, 0x2040, 0, Some([0, 0, 0]), &data, &[(4, logical), (21, model)]);
+        e[0x2C..0x30].copy_from_slice(&number.to_le_bytes());
+        e
+    }
+
+    /// A raster (§B.21) in format 2 with transparent background 0: `rows` of colour indices from
+    /// the top, `pixel` UOR per pixel, the upper left corner at `origin`. The header and one scan
+    /// line element per row.
+    pub fn raster(level: u32, rows: &[&[u8]], pixel: f64, origin: [f64; 3]) -> Vec<Vec<u8>> {
+        let flags: u16 = (2 << 3) | 0x4 | 0x200;
+        let mut head = (rows.len() as u32).to_le_bytes().to_vec();
+        head.extend(flags.to_le_bytes());
+        head.extend([7, 0]);
+        for value in [256u16, rows[0].len() as u16, rows.len() as u16] { head.extend(value.to_le_bytes()); }
+        head.resize(0x80 - 0x68, 0);
+        head.extend(doubles(&[pixel]));
+        head.extend(doubles(&origin));
+        let mut out = vec![element(87, 0x3000, level, shown(0, 0), &head, &[])];
+        for (y, row) in rows.iter().enumerate() {
+            let mut data = flags.to_le_bytes().to_vec();
+            data.extend([7, 0]);
+            data.extend(256u32.to_le_bytes());
+            data.extend((y as u16).to_le_bytes());
+            data.extend((row.len() as u16).to_le_bytes());
+            data.extend(*row);
+            out.push(element(88, 0x4000, level, shown(0, 0), &data, &[]));
+        }
+        out
     }
 
     /// A reference attachment (type 100, §B.20) with sequence `number`, the file name in string
@@ -414,6 +458,7 @@ pub mod v8 {
         pub hidden: bool,
         pub header: Vec<u8>,
         pub graphics: Vec<u8>,
+        pub controls: Vec<u8>,
     }
 
     /// A V8 design file: the default model (header, graphic and control elements), the
@@ -489,6 +534,7 @@ pub mod v8 {
                 let storage = format!("{}/#{:06x}", if m.hidden { "Dgn-Nd" } else { "Dgn-Md" }, m.id);
                 streams.push((format!("{storage}/Dgn~Mh"), m.header.clone()));
                 streams.push((format!("{storage}/Dgn^G/$1"), block(&m.graphics, 6)));
+                if !m.controls.is_empty() { streams.push((format!("{storage}/Dgn^C/$1"), block(&m.controls, 6))); }
             }
             streams.push(("Dgn~H".into(), self.revision.map_or(vec![0; 80], file_header)));
             if let Some(application) = &self.application { streams.push(("\u{5}SummaryInformation".into(), summary_information(application))); }

@@ -5,13 +5,13 @@
 use std::collections::BTreeMap;
 
 use dgn_model::{
-    kind_label, BSplineCurve, BSplineSurface, Cell, Cone, Design, Dimension, Element, Format, Geometry, Level, Mesh, Model, Point, Reference, SharedCell,
-    SharedCellDefinition, Surface, Symbology, Text, Units,
+    kind_label, BSplineCurve, BSplineSurface, Cell, Cone, Design, Dimension, Element, Format, Geometry, Level, Mesh, Model, Point, Reference,
+    SharedCell, SharedCellDefinition, Surface, Symbology, Text, Units,
 };
 use glam::{DMat3, DVec3};
 
 use crate::cfb::{CompoundFile, STORAGE, STREAM};
-use crate::{inflate, knot_vector, latin1, le16, le32, le64, lef64, point, quaternion, v7::color_table, Result, Skipped, MAX_DEPTH, MAX_ELEMENTS};
+use crate::{inflate, knot_vector, latin1, le16, le32, le64, lef64, point, quaternion, raster, v7::color_table, Result, Skipped, MAX_DEPTH, MAX_ELEMENTS};
 
 /// The largest decompressed element stream (less in the browser's 32-bit memory).
 #[cfg(not(target_arch = "wasm32"))]
@@ -20,6 +20,8 @@ const MAX_UNPACKED: usize = 1 << 30;
 const MAX_UNPACKED: usize = 256 << 20;
 /// The largest decompressed model header (`Dgn~Mh`, about 4.4 KB).
 const MAX_MODEL_HEADER: usize = 64 << 10;
+/// The marker of the line strings of §B.11 at +0x70.
+const LINE_STRING_MARKER: [u8; 16] = [0xF0, 0x06, 0x91, 0x7C, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0x06, 0x91, 0x7C, 0xFF, 0xFF, 0xFF, 0xFF];
 /// ID of a string linkage (§B.7).
 pub const STRING_LINKAGE: u16 = 0x56D2;
 /// ID of a fill linkage (§B.7).
@@ -44,10 +46,14 @@ impl<'a> RawElement<'a> {
     /// A component of a complex element.
     pub fn component(&self) -> bool { self.flags() & 0x4000 != 0 }
     /// A header with components: flagged, or of a type that always has them.
-    pub fn complex(&self) -> bool { self.flags() & 0x2000 != 0 || matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 34 | 105) }
-    /// The number of components a header counts (at +0x68), where the specification gives it.
+    /// Non-graphic tables (flag 0x0400) are never complex (§B.3, v0.3).
+    pub fn complex(&self) -> bool {
+        self.flags() & 0x0400 == 0 && (self.flags() & 0x2000 != 0 || matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 34 | 87 | 105))
+    }
+    /// The number of following elements a graphic complex header owns (at +0x68): its whole
+    /// subtree, the components of nested headers included (§B.3, v0.3).
     pub fn component_count(&self) -> Option<u32> {
-        (matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 105) && self.len() >= 0x6C).then(|| self.u32(0x68))
+        (matches!(self.kind(), 2 | 7 | 12 | 14 | 18 | 19 | 24 | 27 | 87 | 105) && self.len() >= 0x6C).then(|| self.u32(0x68))
     }
     /// The level ID (graphic elements) or kind of table entry (non-graphic elements).
     pub fn level(&self) -> u32 { self.u32(0x0C) }
@@ -91,9 +97,9 @@ impl<'a> RawElement<'a> {
     /// The vertices of a line (two points at +0x68) or of a line string, shape, curve, pole or
     /// point string element (a count at +0x68, points from +0x70).
     fn vertices(&self) -> Vec<DVec3> {
-        if self.kind() == 4 && self.flags() & 0x0100 != 0 {
-            // A line string with flag 0x0100 (§B.11): a count N at +0x68, a 16-byte marker at
-            // +0x70, then N - 1 points of two doubles from +0x80. Its stored range is not valid.
+        if self.kind() == 4 && self.bytes.get(0x70..0x80) == Some(&LINE_STRING_MARKER) {
+            // A line string with the 16-byte marker at +0x70 (§B.11; not flag 0x0100, v0.2): a
+            // count N at +0x68, then N - 1 points of two doubles from +0x80. Its range is not valid.
             let count = (self.u32(0x68) as usize).saturating_sub(1).min(self.len().saturating_sub(0x80) / 16);
             return (0..count).map(|k| DVec3::new(self.f64(0x80 + 16 * k), self.f64(0x88 + 16 * k), 0.0)).collect();
         }
@@ -177,24 +183,22 @@ pub fn split(stream: &[u8]) -> Result<(Vec<RawElement<'_>>, bool)> {
     Ok((out, stream[at.min(stream.len())..].iter().any(|&b| b != 0)))
 }
 
-/// The index after element `i` and its components, at most `end`. A top-level element owns
-/// all components that follow it; a nested one as many as its header counts (cells, text nodes,
-/// complex chains and shapes, surfaces, solids, B-splines, meshes). Other nested headers own
-/// nothing: their components are read as their siblings. B-spline headers also own their knot,
-/// pole and weight elements.
+/// The index after element `i` and its components, at most `end`. A graphic complex header owns
+/// the next n elements, n its count at +0x68: its whole subtree (§B.3, v0.3), as far as they are
+/// components. Headers without a count (shared cell definitions) own the components that follow
+/// them at the top level and nothing when nested. B-spline headers also own their knot, pole and
+/// weight elements.
 pub fn span(all: &[RawElement], i: usize, end: usize, depth: usize) -> usize {
     let e = all[i];
     let mut j = i + 1;
     if !e.complex() || depth > MAX_DEPTH { return j; }
     let belongs = |c: &RawElement| c.component() || (matches!(e.kind(), 24 | 27) && matches!(c.kind(), 21 | 26 | 28));
-    if depth == 0 {
-        while j < end && belongs(&all[j]) { j += 1; }
-    } else if let Some(count) = e.component_count() {
-        for _ in 0..count {
-            if j >= end || !belongs(&all[j]) { break; }
-            j = span(all, j, end, depth + 1);
-        }
-    }
+    let stop = match e.component_count() {
+        Some(count) => end.min(j.saturating_add(count as usize)),
+        None if depth == 0 => end,
+        None => return j,
+    };
+    while j < stop && belongs(&all[j]) { j += 1; }
     j
 }
 
@@ -313,6 +317,7 @@ struct ModelHeader {
     name: Option<String>,
     description: Option<String>,
     three_d: bool,
+    sheet: bool,
 }
 
 /// The model header (§B.5, §B.15): zlib data of 4096 bytes, a 4-byte prefix and an element of
@@ -348,6 +353,7 @@ fn model_header(packed: Option<&[u8]>) -> Option<ModelHeader> {
         name: e.string(1),
         description: e.string(2),
         three_d: e.u32(0x44) & 1 != 0,
+        sheet: e.u16(0x22) == 1,
     })
 }
 
@@ -378,7 +384,8 @@ fn levels(tables: &[RawElement]) -> Vec<Level> {
 
 /// A reference attachment (type 100 in `Dgn^C`, §B.20): the sequence number at +0x2C, origins
 /// at +0xA8 (reference side) and +0xC0 (this model), a row-major matrix at +0xD8, the scale at
-/// +0x120 and the file name in string linkage 3.
+/// +0x120 (0 read as 1), the file name in string linkage 3, the logical name in 4 and the
+/// attached model's name in 21. Without a file name it attaches a model of this file.
 fn reference(e: &RawElement, model: u32) -> Option<Reference> {
     if e.len() < 0x128 { return None; }
     let triple = |at: usize| -> Point { [e.f64(at), e.f64(at + 8), e.f64(at + 16)] };
@@ -386,14 +393,15 @@ fn reference(e: &RawElement, model: u32) -> Option<Reference> {
         number: e.u32(0x2C),
         model: Some(model),
         file_name: e.string(3).unwrap_or_default(),
-        logical_name: String::new(),
+        model_name: e.string(21),
+        logical_name: e.string(4).unwrap_or_default(),
         description: String::new(),
         display: None,
         missing: None,
         reference_origin: triple(0xA8),
         master_origin: triple(0xC0),
         matrix: std::array::from_fn(|k| e.f64(0xD8 + 8 * k)),
-        scale: e.f64(0x120),
+        scale: Some(e.f64(0x120)).filter(|s| *s != 0.0).unwrap_or(1.0),
         clip: Vec::new(),
     })
 }
@@ -461,11 +469,11 @@ pub fn read(data: &[u8]) -> Result<Design> {
         }
         // A 3D model has the bit in its header (§B.15) and 3D elements only.
         let three_d = header.as_ref().is_some_and(|h| h.three_d) || graphics.iter().any(|e| e.graphic() && e.three_d());
-        let (origin, units, name, description) = match header {
-            Some(h) => (h.origin, h.units, h.name, h.description),
-            None => (DVec3::ZERO, assumed_units(), None, None),
+        let (origin, units, name, description, sheet) = match header {
+            Some(h) => (h.origin, h.units, h.name, h.description, h.sheet),
+            None => (DVec3::ZERO, assumed_units(), None, None, false),
         };
-        models.push(Model { id: m.id, name, description, three_d, hidden: m.hidden, units, global_origin: point(origin), elements });
+        models.push(Model { id: m.id, name, description, three_d, hidden: m.hidden, sheet, units, global_origin: point(origin), elements });
     }
     let default = &models[0];
     Ok(Design {
@@ -533,9 +541,12 @@ impl Reader {
             // Cells keep their components in world coordinates; text nodes hold text elements.
             // A smart solid or surface (§B.18) is a cell whose last component is Parasolid data
             // (type 38, not graphic): its other components are the wireframe.
-            2 => Geometry::Cell(Cell {
-                name: e.name(), origin: None, transform: None, brep: all[i + 1..stop].iter().any(|c| c.kind() == 38), children: children(self),
-            }),
+            // The Parasolid data is counted as a B-rep that is not read.
+            2 => {
+                let breps = all[i + 1..stop].iter().filter(|c| c.kind() == 38).count();
+                for _ in 0..breps { self.skipped.add("B-rep (not supported, wireframe shown)"); }
+                Geometry::Cell(Cell { name: e.name(), origin: None, transform: None, brep: breps > 0, children: children(self) })
+            }
             7 => Geometry::TextNode {
                 number: if e.len() >= 0x70 { e.u32(0x6C) } else { 0 }, origin: None, line_spacing: None, children: children(self),
             },
@@ -576,6 +587,10 @@ impl Reader {
                 None => { self.malformed(&e); return None; }
             },
             24 => match bspline_surface(&e, &all[i + 1..stop]) {
+                Some(g) => g,
+                None => { self.malformed(&e); return None; }
+            },
+            87 => match raster_image(&e, &all[i + 1..stop]) {
                 Some(g) => g,
                 None => { self.malformed(&e); return None; }
             },
@@ -720,6 +735,26 @@ fn cone(e: &RawElement) -> Option<Geometry> {
     }))
 }
 
+/// A raster (§B.21): flags at +0x6C (format in bits 3 to 7, transparent bit 9), foreground and
+/// background colour at +0x6E, width and height at +0x72, UOR per pixel at +0x80 and the upper
+/// left corner at +0x88; each scan line (88) its row at +0x70, its number of pixels at +0x72 and
+/// the pixel data from +0x74.
+fn raster_image(header: &RawElement, parts: &[RawElement]) -> Option<Geometry> {
+    if header.len() < 0xA0 { return None; }
+    let flags = header.u16(0x6C);
+    let (foreground, background) = (header.bytes[0x6E], header.bytes[0x6F]);
+    let (width, height) = (u32::from(header.u16(0x72)), u32::from(header.u16(0x74)));
+    let mut image = raster::Image::new(width, height, (flags >> 3) as u8 & 0x1F, foreground, background)?;
+    for p in parts.iter().filter(|p| p.kind() == 88 && p.len() >= 0x74) {
+        let count = usize::from(p.u16(0x72));
+        image.row(u32::from(p.u16(0x70)), 0, count, &p.bytes[0x74..]);
+    }
+    let origin = [header.f64(0x88), header.f64(0x90), header.f64(0x98)];
+    let pixel_size = header.f64(0x80);
+    if !(origin.iter().all(|v| v.is_finite()) && pixel_size.is_finite() && pixel_size > 0.0) { return None; }
+    Some(Geometry::Raster(image.finish(origin, pixel_size, flags & 0x200 != 0)))
+}
+
 /// A mesh (§B.17) from its components: each array header (101) gives the role of the array
 /// that follows (2: vertices as doubles, type 103; 1: vertex indices as i32, type 102). Indices
 /// are 1-based, negative for an invisible edge, 0 closes a face; faces with an index beyond the
@@ -830,25 +865,44 @@ mod tests {
     use crate::synth::v8::*;
 
     #[test]
-    fn nested_text_nodes_own_as_many_texts_as_they_count() {
-        // A cell of two components: a text node of one text, then a text of the cell itself.
+    fn complex_headers_count_their_whole_subtree() {
+        // A cell holding a text node of two texts: the cell counts 3 following elements (§B.3,
+        // v0.3), the text node 2; then a line of the cell itself, and a top-level line.
         let text = text_data([300.0, 300.0], [0.0, 0.0], b"X");
+        let line = doubles(&[0.0, 0.0, 1000.0, 0.0]);
         let mut stream = Vec::new();
         for element in [
-            element(2, 0x3000, 1, shown(0, 0), &[2, 0, 0, 0, 0, 0, 0, 0], &[]),
-            element(7, 0x7000, 1, shown(0, 0), &[1, 0, 0, 0, 0, 0, 0, 0], &[]),
+            element(2, 0x3000, 1, shown(0, 0), &[4, 0, 0, 0, 0, 0, 0, 0], &[]),
+            element(7, 0x7000, 1, shown(0, 0), &[2, 0, 0, 0, 1, 0, 0, 0], &[]),
             element(17, 0x5000, 1, shown(0, 0), &text, &[]),
             element(17, 0x5000, 1, shown(0, 0), &text, &[]),
+            element(3, 0x5000, 1, shown(0, 0), &line, &[]),
+            element(3, 0x1000, 1, shown(0, 0), &line, &[]),
         ] {
-            stream.extend([0; 4]);
-            stream.extend(element);
+            push(&mut stream, element);
         }
         let (all, broken) = split(&stream).unwrap();
         assert!(!broken);
-        assert_eq!(all.len(), 4);
-        assert_eq!(span(&all, 1, all.len(), 1), 3, "the nested text node owns one text");
-        assert_eq!(span(&all, 0, all.len(), 1), 4, "a nested cell owns its two components");
-        assert_eq!(span(&all, 0, all.len(), 0), 4);
+        assert_eq!(all.len(), 6);
+        assert_eq!(span(&all, 1, all.len(), 1), 4, "the nested text node owns its two texts");
+        assert_eq!(span(&all, 0, all.len(), 0), 5, "the cell owns the text node, its texts and the line");
+        assert_eq!(span(&all, 0, 3, 0), 3, "never beyond the end");
+        // A non-graphic table with flag 0x2000 is not complex.
+        let table = element(96, 0x2400, 1, None, &[9, 0, 0, 0], &[]);
+        assert!(!RawElement { bytes: &table }.complex());
+    }
+
+    #[test]
+    fn only_the_marker_makes_the_odd_line_string() {
+        // An ordinary line string with flag 0x0100 keeps its first point (§B.11, v0.2).
+        let plain = element(4, 0x1100, 1, shown(0, 0), &counted(2, &[1.0, 2.0, 3.0, 4.0]), &[]);
+        assert_eq!(RawElement { bytes: &plain }.vertices(), [DVec3::new(1.0, 2.0, 0.0), DVec3::new(3.0, 4.0, 0.0)]);
+        let mut data = 3u32.to_le_bytes().to_vec();
+        data.extend([0; 4]);
+        data.extend(LINE_STRING_MARKER);
+        data.extend(doubles(&[1.0, 2.0, 3.0, 4.0]));
+        let marked = element(4, 0x1000, 1, shown(0, 0), &data, &[]);
+        assert_eq!(RawElement { bytes: &marked }.vertices(), [DVec3::new(1.0, 2.0, 0.0), DVec3::new(3.0, 4.0, 0.0)]);
     }
 
     #[test]
