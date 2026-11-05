@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dgn-model",
     "crates/dgn-read",
+    "crates/dgn-export",
 ]
 
 [workspace.package]
