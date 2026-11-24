@@ -4,8 +4,7 @@ Native library (DLL) that reads MicroStation design files (`.dgn`) of all versio
 MicroStation, for [Open 3D Viewer Studio](https://github.com/OpenAEC-Foundation/open-3d-viewer),
 [OpenCAD Studio](https://github.com/OpenAEC-Foundation/OpenCADStudio) and other tools.
 
-**Status:** private, pre-alpha. Do not make this repository public without a decision by the
-maintainers (see "Legal" below).
+**Status:** pre-alpha.
 
 ## Scope
 
